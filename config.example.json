@@ -1,0 +1,79 @@
+{
+  "username": "your-github-login",
+  "timezone": "America/Toronto",
+  "state_dir": "/var/lib/gitdisplay",
+
+  "github": {
+    "endpoint": "https://api.github.com/graphql",
+    "timeout": "30s",
+    "max_retries": 4,
+    "user_agent": "gitdisplay/1.0"
+  },
+
+  "languages": {
+    "enabled": true,
+    "ttl": "12h",
+    "title": "Most Used Languages",
+    "count": 10,
+
+    "exclude_archived": true,
+    "exclude_repos": [],
+
+    "hide_languages": [
+      "html", "css", "scss", "Less", "ShaderLab", "Handlebars", "Mathematica",
+      "HLSL", "PowerShell", "Makefile", "EJS", "Vue", "Dockerfile",
+      "Rich Text Format", "Shell", "GDScript", "HCL", "Just"
+    ],
+
+    "language_aliases": {
+      "TSQL": "SQL",
+      "PLpgSQL": "SQL",
+      "PLSQL": "SQL"
+    },
+
+    "byte_overrides": {},
+    "exclude_paths": {},
+    "resolve_hack_files": true,
+    "hack_file_limit": 200,
+
+    "percent_of_displayed": true,
+    "max_repos": 0,
+    "languages_per_repo": 50,
+
+    "theme": {
+      "title": "#ffb000",
+      "text": "#ffffff",
+      "background": "#000000",
+      "border": "#e4e2e2",
+      "track": "#dddddd",
+      "hide_border": false
+    }
+  },
+
+  "streak": {
+    "enabled": true,
+    "ttl": "20m",
+    "exclude_days": [],
+    "start_year": 0,
+
+    "theme": {
+      "background": "#000000",
+      "border": "#e4e2e2",
+      "text": "#fefefe",
+      "label": "#fefefe",
+      "dates": "#9e9e9e",
+      "accent": "#fb8c00",
+      "divider": "#e4e2e2",
+      "hide_border": false
+    }
+  },
+
+  "server": {
+    "addr": "127.0.0.1:8080",
+    "read_timeout": "5s",
+    "write_timeout": "10s",
+    "idle_timeout": "60s",
+    "langs_max_age": "1h",
+    "streak_max_age": "5m"
+  }
+}

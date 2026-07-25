@@ -1,0 +1,31 @@
+[Unit]
+Description=gitdisplay - SVG cards for a GitHub profile README
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/gitdisplay -config /etc/gitdisplay/config.json
+
+# certbot's --deploy-hook sends this to pick up a renewed certificate at once.
+# Without it the service notices the new PEM files within a minute anyway.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# GITHUB_TOKEN lives here. 0600, so it stays out of the unit file and out of
+# the command line where ps would show it.
+EnvironmentFile=/etc/gitdisplay/env
+
+Restart=always
+RestartSec=5s
+
+# The last good render is written to /var/lib/gitdisplay and read back on
+# start, so a reboot serves the previous card immediately instead of a blank
+# one.
+StateDirectory=gitdisplay
+
+# The box has 512 MB. Steady state is two rendered SVGs plus Go's runtime, a
+# few MB. This is headroom for a refresh, not a target.
+MemoryMax=128M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,29 @@
+{
+  "Rules": [
+    {
+      "ID": "binaries-keep-two-rollbacks",
+      "Status": "Enabled",
+      "Filter": { "Tag": { "Key": "kind", "Value": "bin" } },
+      "NoncurrentVersionExpiration": {
+        "NewerNoncurrentVersions": 2,
+        "NoncurrentDays": 7
+      }
+    },
+    {
+      "ID": "config-keep-history-90-days",
+      "Status": "Enabled",
+      "Filter": { "Tag": { "Key": "kind", "Value": "config" } },
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 90
+      }
+    },
+    {
+      "ID": "abort-incomplete-multipart",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "" },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 7
+      }
+    }
+  ]
+}

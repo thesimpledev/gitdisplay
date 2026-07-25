@@ -1,0 +1,22 @@
+# Build output
+/dist/
+/out/
+
+# Runtime state: the last good render, written by the service.
+/state/
+
+# The live configuration holds the repository exclusion list and is deliberately
+# kept off GitHub. config.example.json is the version that ships.
+/config.local.json
+/config.json
+/config.prod.json
+
+# Secrets. The token lives on the server and nowhere else.
+/env
+/env.*
+*.pem
+*.key
+
+# goaudit writes this per run; the capability baseline is committed, the
+# report is not.
+goaudit-report.json
