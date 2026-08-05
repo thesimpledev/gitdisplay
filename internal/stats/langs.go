@@ -1,3 +1,5 @@
+// Package stats aggregates the fetched GitHub data into the results the
+// cards render: language rankings and contribution streaks.
 package stats
 
 import (

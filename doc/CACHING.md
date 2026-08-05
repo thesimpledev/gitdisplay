@@ -4,7 +4,7 @@ GitHub does not let a README load an image from your server directly. Every
 `<img>` in a README is rewritten to a `camo.githubusercontent.com` URL, and
 camo fetches the real image on GitHub's side. Two consequences follow.
 
-**Your server sees camo, not readers.** Traffic is roughly one fetch per camo
+**Your CDN sees camo, not readers.** Traffic is roughly one fetch per camo
 cache miss, not one per person viewing your profile. Response time barely
 matters for the reader; freshness does.
 
@@ -15,35 +15,24 @@ URL is worse than useless: camo keys on the URL, so a URL that changes every
 request means camo never serves a cached copy and every reader waits on a
 fresh origin fetch.
 
-## What this service sends
+## What gets sent
 
-For each card:
+The chain is now camo -> CloudFront -> S3. Each uploaded card carries:
 
 ```
-Cache-Control: public, max-age=<n>, s-maxage=<n>, must-revalidate
-ETag: "<hash of the rendered bytes>"
-Last-Modified: <when the render was produced>
-Vary: Accept-Encoding
+Content-Type: image/svg+xml; charset=utf-8
+Cache-Control: public, max-age=<n>
 ```
 
-`max-age` is per card, from `server.langs_max_age` and
-`server.streak_max_age`. The defaults are one hour for languages and five
-minutes for the streak, matching how fast each actually changes.
+`max-age` is per card, from `langs_max_age` and `streak_max_age` in the
+config. The defaults are one hour for languages and five minutes for the
+streak, matching how fast each actually changes.
 
-The point of `must-revalidate` together with a strong `ETag` is that a
-revalidation is cheap. When camo re-checks, it sends `If-None-Match`; if the
-card has not changed the answer is a `304` with no body. So a short `max-age`
-costs very little even if camo checks often. This is the opposite of the
-`immutable` or multi-day `max-age` that a static asset would want.
-
-The `ETag` is a hash of the rendered SVG, not of the time it was rendered. A
-refresh that produces an identical card keeps the same `ETag`, so a
-revalidation still returns `304` and nothing is transferred. The `ETag` only
-changes when the picture actually changes.
-
-Note the two representations. When a client accepts gzip it gets the
-pre-compressed body under an `ETag` with a `-gz` suffix, because a cache
-holding one encoding must never answer a revalidation for the other.
+S3 supplies `ETag` and `Last-Modified` for the object, and CloudFront passes
+the headers through, so a revalidation is still cheap: when a cache re-checks
+an unchanged card the answer is a `304` with no body. A short `max-age`
+therefore costs very little even if camo checks often. This is the opposite
+of the `immutable` or multi-day `max-age` that a static asset would want.
 
 ## What to actually expect
 
@@ -53,20 +42,20 @@ changed card can take longer to appear on a profile than `max-age` suggests.
 Treat the headers as the part you control and the propagation delay as
 something to live with.
 
-If a card looks stale while `/healthz` shows a recent successful refresh, the
-service is fine and camo is holding an old copy. Fetching your own origin URL
-directly will confirm which side is stale:
+If a card looks stale, fetch the CDN URL directly and compare
+`Last-Modified` with the schedule; the function's CloudWatch logs show
+whether recent runs succeeded. A stale card with a recent `Last-Modified`
+means camo is holding an old copy:
 
 ```
-curl -sI https://codestats.thesimpledev.com/streak.svg
-curl -s https://codestats.thesimpledev.com/healthz | jq '.cards | map_values(.last_success_at)'
+curl -sI https://cdn.thesimpledev.com/cards/streak.svg
 ```
 
-## Why refreshes never happen on the request path
+## Why rendering never happens on the request path
 
-A full refresh is about fifteen GraphQL calls and takes seconds. If that ran
+A full run is about fifteen GraphQL calls and takes seconds. If that ran
 while camo was waiting, a cache miss would be a multi-second stall, and a
-GitHub outage would turn into a broken image in the README. Instead a
-background goroutine refreshes on a timer and stores the rendered bytes; a
-request is a map lookup and a write. A failed refresh leaves the previous
-render in place, so the card degrades to slightly stale rather than to blank.
+GitHub outage would turn into a broken image in the README. Instead the
+Lambda function renders on a schedule and uploads static files; a request
+only ever touches CloudFront and S3. A failed run uploads nothing, so the
+card degrades to slightly stale rather than to blank.

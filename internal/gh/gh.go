@@ -21,7 +21,9 @@ import (
 	"time"
 )
 
-func readFile(path string) ([]byte, error) { return os.ReadFile(path) }
+func readFile(path string) ([]byte, error) {
+	return os.ReadFile(path) // #nosec G304 -- the path is the operator's own -from/-dump CLI argument; reading it is the feature
+}
 
 // Data is the complete raw fetch. It is the -dump format and the fixture
 // format the tests read.
@@ -292,7 +294,16 @@ func rateLimitWait(resp *http.Response) (time.Duration, bool) {
 }
 
 func backoff(attempt int) time.Duration {
-	d := time.Duration(1<<uint(attempt-1)) * time.Second
+	// Bound the shift so the doubling can never overflow; past 5 the cap
+	// below decides anyway.
+	shift := attempt - 1
+	if shift < 0 {
+		shift = 0
+	}
+	if shift > 5 {
+		shift = 5
+	}
+	d := time.Duration(1<<shift) * time.Second
 	if d > 30*time.Second {
 		d = 30 * time.Second
 	}

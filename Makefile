@@ -2,20 +2,22 @@ BINARY  := gitdisplay
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build test vet fmt clean run once dump
+.PHONY: all build test vet fmt clean once dump
 
 all: vet test build
 
-# Static linux/arm64 binary for the t4g.nano (Graviton).
+# Lambda deployment artifact: a static linux/arm64 binary named bootstrap
+# (the name provided.al2023 requires), zipped with the binary at the zip
+# root and its executable bit intact.
 #
-# CGO_ENABLED=0 removes the libc dependency, so the binary runs on any arm64
-# Linux regardless of distribution or glibc version. -s -w drops the symbol
-# table and DWARF data, which is a few MB off the download for no loss at
-# runtime; keep them if you intend to run a debugger on the instance.
+# CGO_ENABLED=0 removes the libc dependency. -tags lambda.norpc drops the
+# RPC path aws-lambda-go only needs on the retired go1.x runtime. -s -w
+# drops the symbol table and DWARF data.
 build:
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-		go build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BINARY)-linux-arm64 .
-	@ls -lh dist/$(BINARY)-linux-arm64
+		go build -trimpath -tags lambda.norpc -ldflags "$(LDFLAGS)" -o dist/bootstrap .
+	cd dist && rm -f $(BINARY)-lambda.zip && zip $(BINARY)-lambda.zip bootstrap
+	@ls -lh dist/$(BINARY)-lambda.zip
 
 # Local build for this machine.
 build-host:
@@ -30,11 +32,7 @@ vet:
 fmt:
 	gofmt -l -w .
 
-# Run locally against config.local.json.
-run: build-host
-	GITHUB_TOKEN=$$(gh auth token) ./dist/$(BINARY) -config config.local.json
-
-# Render both cards to ./out without starting the server.
+# Render both cards to ./out.
 once: build-host
 	GITHUB_TOKEN=$$(gh auth token) ./dist/$(BINARY) -config config.local.json -once -out out
 
@@ -44,4 +42,4 @@ dump: build-host
 		-dump testdata/fetch-$$(date +%Y-%m-%d).json
 
 clean:
-	rm -rf dist out state
+	rm -rf dist out

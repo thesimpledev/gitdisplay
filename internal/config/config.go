@@ -1,9 +1,10 @@
-// Package config loads and validates the on-disk configuration.
+// Package config loads and validates the configuration.
 //
 // Everything that shapes a card — which repos to skip, which languages to
-// hide, which vendored byte counts to zero out — lives in this file on the
-// server. None of it is accepted from the query string, so the card URL in a
-// README never discloses the exclusion list.
+// hide, which vendored byte counts to zero out — lives in one JSON document,
+// read from a local file (Load) or from bytes fetched elsewhere (LoadBytes).
+// None of it is accepted from the query string, so the card URL in a README
+// never discloses the exclusion list.
 package config
 
 import (
@@ -17,6 +18,7 @@ import (
 // Duration wraps time.Duration so it can be written in JSON as "12h".
 type Duration time.Duration
 
+// UnmarshalJSON parses a duration string such as "12h".
 func (d *Duration) UnmarshalJSON(b []byte) error {
 	var s string
 	if err := json.Unmarshal(b, &s); err != nil {
@@ -33,6 +35,7 @@ func (d *Duration) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
+// MarshalJSON writes the duration back in the same string form.
 func (d Duration) MarshalJSON() ([]byte, error) {
 	return json.Marshal(time.Duration(d).String())
 }
@@ -50,14 +53,16 @@ type Config struct {
 	// so this has to be pinned rather than inherited from the host.
 	Timezone string `json:"timezone"`
 
-	// StateDir holds the last good render of each card so a restart serves
-	// immediately instead of a blank card.
-	StateDir string `json:"state_dir"`
+	// LangsMaxAge and StreakMaxAge are the Cache-Control max-age set on each
+	// uploaded card. See doc/CACHING.md: GitHub proxies README images through
+	// camo, which keeps its own copy, so these are chosen to make camo
+	// revalidate rather than to fight it.
+	LangsMaxAge  Duration `json:"langs_max_age"`
+	StreakMaxAge Duration `json:"streak_max_age"`
 
 	GitHub    GitHub    `json:"github"`
 	Languages Languages `json:"languages"`
 	Streak    Streak    `json:"streak"`
-	Server    Server    `json:"server"`
 
 	// loc is the resolved Timezone.
 	loc *time.Location
@@ -77,9 +82,8 @@ type GitHub struct {
 
 // Languages configures the top-languages card.
 type Languages struct {
-	Enabled bool     `json:"enabled"`
-	TTL     Duration `json:"ttl"`
-	Title   string   `json:"title"`
+	Enabled bool   `json:"enabled"`
+	Title   string `json:"title"`
 
 	// Count is how many languages appear on the card.
 	Count int `json:"count"`
@@ -220,8 +224,7 @@ type Languages struct {
 
 // Streak configures the contribution streak card.
 type Streak struct {
-	Enabled bool     `json:"enabled"`
-	TTL     Duration `json:"ttl"`
+	Enabled bool `json:"enabled"`
 
 	// ExcludeDays lists weekday names ("Sun", "Sat") that do not break a
 	// streak. An excluded day extends a streak that is already running but
@@ -261,54 +264,12 @@ type StreakTheme struct {
 	HideBorder bool   `json:"hide_border"`
 }
 
-// Server configures the listener, TLS and the cache headers.
-type Server struct {
-	Addr string `json:"addr"`
-
-	// TLSCertFile and TLSKeyFile turn on HTTPS. Both must be set, or
-	// neither. The service serves TLS itself with the standard library;
-	// there is no proxy in front of it.
-	//
-	// Go's standard library has no ACME client, so obtaining and renewing
-	// the certificate is a separate concern from serving it. Point these at
-	// whatever produces the PEM files; the service reloads them on SIGHUP.
-	TLSCertFile string `json:"tls_cert_file"`
-	TLSKeyFile  string `json:"tls_key_file"`
-
-	// RedirectHTTP runs a second listener on RedirectAddr that answers every
-	// request with a permanent redirect to the HTTPS URL.
-	RedirectHTTP bool   `json:"redirect_http"`
-	RedirectAddr string `json:"redirect_addr"`
-
-	// ACMEWebroot is served at /.well-known/acme-challenge/ on the plain HTTP
-	// listener, so certbot can answer an HTTP-01 challenge with --webroot
-	// while this service keeps port 80. Without it certbot would have to bind
-	// port 80 itself, which means stopping the service to renew.
-	ACMEWebroot string `json:"acme_webroot"`
-
-	// PublicHost is the hostname used when building redirect targets. It
-	// also gates HSTS, which is only sent when TLS is on.
-	PublicHost string `json:"public_host"`
-
-	// ReadTimeout and WriteTimeout bound a request. Responses come from
-	// memory, so these only need to survive a slow client.
-	ReadTimeout  Duration `json:"read_timeout"`
-	WriteTimeout Duration `json:"write_timeout"`
-	IdleTimeout  Duration `json:"idle_timeout"`
-
-	// LangsMaxAge and StreakMaxAge are the max-age sent for each card.
-	// See doc/CACHING.md: GitHub proxies README images through camo, which
-	// keeps its own copy, so these are chosen to make camo revalidate rather
-	// than to fight it.
-	LangsMaxAge  Duration `json:"langs_max_age"`
-	StreakMaxAge Duration `json:"streak_max_age"`
-}
-
 // Default returns a configuration with every field populated.
 func Default() Config {
 	return Config{
-		Timezone: "UTC",
-		StateDir: "/var/lib/gitdisplay",
+		Timezone:     "UTC",
+		LangsMaxAge:  Duration(1 * time.Hour),
+		StreakMaxAge: Duration(5 * time.Minute),
 		GitHub: GitHub{
 			Endpoint:   "https://api.github.com/graphql",
 			Timeout:    Duration(30 * time.Second),
@@ -317,7 +278,6 @@ func Default() Config {
 		},
 		Languages: Languages{
 			Enabled:            true,
-			TTL:                Duration(12 * time.Hour),
 			Title:              "Most Used Languages",
 			Count:              10,
 			ActiveLabel:        "Active",
@@ -339,7 +299,6 @@ func Default() Config {
 		},
 		Streak: Streak{
 			Enabled: true,
-			TTL:     Duration(20 * time.Minute),
 			Theme: StreakTheme{
 				Background: "#000000",
 				Border:     "#e4e2e2",
@@ -350,31 +309,36 @@ func Default() Config {
 				Divider:    "#e4e2e2",
 			},
 		},
-		Server: Server{
-			Addr:         "127.0.0.1:8080",
-			RedirectAddr: ":80",
-			ReadTimeout:  Duration(5 * time.Second),
-			WriteTimeout: Duration(10 * time.Second),
-			IdleTimeout:  Duration(60 * time.Second),
-			LangsMaxAge:  Duration(1 * time.Hour),
-			StreakMaxAge: Duration(5 * time.Minute),
-		},
 	}
 }
 
 // Load reads a JSON config file over the defaults and validates the result.
 func Load(path string) (Config, error) {
+	raw, err := os.ReadFile(path) // #nosec G304 -- the path is the operator's own -config CLI argument; reading it is the point
+	if err != nil {
+		return Default(), fmt.Errorf("read config: %w", err)
+	}
+	cfg, err := LoadBytes(raw)
+	if err != nil {
+		return cfg, fmt.Errorf("config %s: %w", path, err)
+	}
+	return cfg, nil
+}
+
+// LoadBytes decodes JSON config bytes over the defaults and validates the
+// result. It is the path-free half of Load, for config that arrives from
+// somewhere other than the local filesystem.
+func LoadBytes(raw []byte) (Config, error) {
 	cfg := Default()
 
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return cfg, fmt.Errorf("read config: %w", err)
+	if len(raw) == 0 {
+		return cfg, fmt.Errorf("config is empty")
 	}
 
 	dec := json.NewDecoder(strings.NewReader(string(raw)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
-		return cfg, fmt.Errorf("parse %s: %w", path, err)
+		return cfg, fmt.Errorf("parse: %w", err)
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -424,37 +388,15 @@ func (c *Config) Validate() error {
 	if c.GitHub.MaxRetries < 0 {
 		return fmt.Errorf("github.max_retries cannot be negative")
 	}
-	if strings.TrimSpace(c.StateDir) == "" {
-		return fmt.Errorf("state_dir is required")
-	}
 	for _, day := range c.Streak.ExcludeDays {
 		if _, ok := weekdayByName(day); !ok {
 			return fmt.Errorf("streak.exclude_days: %q is not a weekday name (use Sun, Mon, Tue, Wed, Thu, Fri, Sat)", day)
 		}
 	}
 	if !c.Languages.Enabled && !c.Streak.Enabled {
-		return fmt.Errorf("both cards are disabled; nothing to serve")
-	}
-
-	certSet := strings.TrimSpace(c.Server.TLSCertFile) != ""
-	keySet := strings.TrimSpace(c.Server.TLSKeyFile) != ""
-	if certSet != keySet {
-		return fmt.Errorf("server.tls_cert_file and server.tls_key_file must both be set, or neither")
-	}
-	if c.Server.RedirectHTTP {
-		if !certSet {
-			return fmt.Errorf("server.redirect_http needs TLS to redirect to")
-		}
-		if strings.TrimSpace(c.Server.PublicHost) == "" {
-			return fmt.Errorf("server.redirect_http needs server.public_host to build the target URL")
-		}
+		return fmt.Errorf("both cards are disabled; nothing to render")
 	}
 	return nil
-}
-
-// TLSEnabled reports whether a certificate pair was configured.
-func (s Server) TLSEnabled() bool {
-	return strings.TrimSpace(s.TLSCertFile) != "" && strings.TrimSpace(s.TLSKeyFile) != ""
 }
 
 // ExcludedWeekdays resolves ExcludeDays into a set.

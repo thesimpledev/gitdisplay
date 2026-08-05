@@ -1,7 +1,8 @@
 {
   "username": "your-github-login",
   "timezone": "America/Toronto",
-  "state_dir": "/var/lib/gitdisplay",
+  "langs_max_age": "1h",
+  "streak_max_age": "5m",
 
   "github": {
     "endpoint": "https://api.github.com/graphql",
@@ -12,7 +13,6 @@
 
   "languages": {
     "enabled": true,
-    "ttl": "12h",
     "title": "Most Used Languages",
     "count": 10,
 
@@ -52,7 +52,6 @@
 
   "streak": {
     "enabled": true,
-    "ttl": "20m",
     "exclude_days": [],
     "start_year": 0,
 
@@ -66,14 +65,5 @@
       "divider": "#e4e2e2",
       "hide_border": false
     }
-  },
-
-  "server": {
-    "addr": "127.0.0.1:8080",
-    "read_timeout": "5s",
-    "write_timeout": "10s",
-    "idle_timeout": "60s",
-    "langs_max_age": "1h",
-    "streak_max_age": "5m"
   }
 }

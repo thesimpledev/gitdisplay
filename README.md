@@ -1,7 +1,12 @@
 # gitdisplay
 
-Self-hosted SVG cards for a GitHub profile README: most-used languages, and
-contribution streak. Go 1.26, standard library only, no third-party modules.
+SVG cards for a GitHub profile README: most-used languages, and contribution
+streak. A Go 1.26 program that an AWS Lambda function runs every 20 minutes;
+it fetches from GitHub, renders both cards, and uploads them to S3, where
+CloudFront serves them as static files.
+
+Two branches: `master` is the Lambda version described here; `ec2-deploy`
+holds the earlier self-hosted HTTPS server exactly as it ran on EC2.
 
 ```
 ┌─ Most Used Languages ────────────────────────────────┐
@@ -86,42 +91,35 @@ common case.
 | Archived projects | mixed in | separate column, or excluded |
 | Contribution years | clamped to account creation | every year GitHub reports |
 | Vendored code | counted | excluded by repo, path, or exact byte override |
-| A config entry that matches nothing | silent | warned on stderr and in `/healthz` |
-| Refresh | on request, 3h–24h cache | background goroutine, in-memory serve |
+| A config entry that matches nothing | silent | warned in the logs on every run |
+| Refresh | on request, 3h–24h cache | rendered on a schedule, served as static files |
 
-## How it serves
+## How it publishes
 
-A full refresh is about fifteen GraphQL calls and takes seconds. That never
-happens while a request is waiting.
+A full run is about fifteen GraphQL calls and takes seconds. No request ever
+waits on it: readers only ever fetch static SVGs from CloudFront.
 
-- A background goroutine per card refreshes on a timer and stores the rendered
-  SVG bytes in memory. A request is a map lookup and a write — well under a
-  millisecond.
-- Separate intervals per card.
-- **A failed refresh leaves the previous render in place.** An empty, partial,
-  or error card is never served into a README.
-- Each render is mirrored to disk and read back at start, so a restart or
-  reboot serves the last good card immediately instead of a blank one.
-- `ETag`, `Last-Modified` and `Cache-Control` are set per card. See
-  [doc/CACHING.md](doc/CACHING.md) for why they are what they are, and what
-  GitHub's camo proxy does with them.
-
-It serves TLS itself. No reverse proxy, no sidecar. certbot renews the
-certificate and the service picks up the new files without a restart.
-
-Endpoints:
-
-| Path | What |
-| --- | --- |
-| `/top-langs.svg` | languages card |
-| `/streak.svg` | streak card |
-| `/healthz` | JSON: per-card last successful refresh, last error, config warnings |
+- An EventBridge Scheduler rule invokes the Lambda function every 20 minutes.
+  Each invocation fetches, renders both cards, and uploads them to S3 with
+  `Content-Type` and `Cache-Control` set per card.
+- **A failed run uploads nothing.** The previously published cards keep
+  serving; an empty, partial, or error card never reaches a README.
+- `Cache-Control` per card is set from `langs_max_age` / `streak_max_age`.
+  See [doc/CACHING.md](doc/CACHING.md) for why the values are what they are,
+  and what GitHub's camo proxy does with them.
 
 ## Configuration
 
-Everything lives in a JSON file on the server. Nothing is read from the query
-string, so the URL in your README never discloses which repositories you skip.
-Start from [`config.example.json`](config.example.json).
+Everything lives in one JSON document, read from S3 at cold start (locally,
+the `-config` flag points at a file). Nothing is read from the query string,
+so the URL in your README never discloses which repositories you skip. Start
+from [`config.example.json`](config.example.json).
+
+The function itself takes only five environment variables: `CONFIG_BUCKET`
+and `CONFIG_KEY` (where the config JSON lives), `CARDS_BUCKET` and
+`CARDS_PREFIX` (where the rendered cards go), and `GITHUB_TOKEN`. A config
+change in S3 takes effect when the execution environment next recycles; any
+`update-function-configuration` call forces that immediately.
 
 Selected settings:
 
@@ -146,7 +144,7 @@ GitHub reports one language byte total per repository with no breakdown by
 directory, so a directory cannot simply be subtracted. For repositories with a
 path exclusion the service reads the git tree, sums blob sizes under each
 prefix, works out the language of each file, and takes that off the totals.
-Every subtraction is logged and appears in `/healthz`.
+Every subtraction is logged on every run.
 
 Two things worth knowing:
 
@@ -162,7 +160,6 @@ Two things worth knowing:
 ## Command line
 
 ```
-gitdisplay -config /etc/gitdisplay/config.json      # serve
 gitdisplay -config … -once -out ./out              # render both cards to files, exit
 gitdisplay -config … -dump data.json               # write the raw API data, exit
 gitdisplay -config … -from data.json -once -out .  # render from a dump, no network
@@ -170,48 +167,39 @@ gitdisplay -config … -now 2026-07-25 …             # freeze "today" for repr
 ```
 
 `-dump` captures a fixture; `-from` replays it. Together they let you debug a
-card, or reproduce a bug, without touching the API or the running server.
+card, or reproduce a bug, without touching the API. Lambda mode is picked
+automatically when `AWS_LAMBDA_RUNTIME_API` is set; there is no serve mode on
+this branch.
 
 `GITHUB_TOKEN` needs `repo` and `read:user`. The only host contacted is
 `api.github.com`.
 
 ## Build
 
-Static `linux/arm64` binary, which is what runs in production on a t4g.nano:
+The deployment artifact is a static `linux/arm64` binary named `bootstrap`
+(the name the `provided.al2023` Lambda runtime requires), zipped with the
+binary at the zip root:
 
 ```sh
-make build
+make build          # produces dist/gitdisplay-lambda.zip
 ```
 
-or
-
-```sh
-CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
-  go build -trimpath -ldflags "-s -w -X main.version=$(git describe --tags --always --dirty)" \
-  -o dist/gitdisplay-linux-arm64 .
-```
-
-`CGO_ENABLED=0` removes the libc dependency, so it runs on any arm64 Linux.
-Resident set is around 17 MB idle.
+`CGO_ENABLED=0` removes the libc dependency; `-tags lambda.norpc` drops the
+RPC path aws-lambda-go only needs on the retired go1.x runtime. Dependencies
+are vendored, so builds work with no network access. `make build-host` builds
+the local CLI for this machine.
 
 ## Deploy
 
-`deploy/gitdisplay.service` is the systemd unit. In short:
+Production runs as a Lambda function (arm64, `provided.al2023`) invoked by an
+EventBridge Scheduler rule every 20 minutes, uploading to the S3 origin behind
+a CloudFront distribution.
 
-```sh
-sudo install -m 0755 gitdisplay-linux-arm64 /usr/local/bin/gitdisplay
-sudo install -d -m 0750 /etc/gitdisplay
-sudo install -m 0640 config.json /etc/gitdisplay/config.json
-sudo install -m 0600 env /etc/gitdisplay/env          # GITHUB_TOKEN=...
-sudo cp deploy/gitdisplay.service /etc/systemd/system/
-sudo systemctl daemon-reload && sudo systemctl enable --now gitdisplay
-```
-
-Certificates come from certbot with `--webroot`. The service serves
-`/.well-known/acme-challenge/` on port 80 itself, so renewal never needs the
-port and never needs the service stopped. certbot's `--deploy-hook` calls
-`systemctl reload gitdisplay`, which sends `SIGHUP` and reloads the
-certificate with no downtime.
+Releases are deployed by CI on tag push only: tagging `prod-{version}` runs
+the workflow in `.github/workflows/deploy.yml`, which runs the gates and
+tests, builds the zip, authenticates to AWS through GitHub's OIDC provider
+(no static keys anywhere), and updates the function code. Nothing deploys on
+a branch push.
 
 ## Behaviour that looks wrong and is not
 
@@ -236,13 +224,11 @@ certificate with no downtime.
 go test ./...
 ```
 
-No test touches the network. Everything runs off a `-dump` fixture, with
-`today` frozen to the date the expected numbers were taken from the live cards.
-
-The languages suite pins the *old* behaviour first — first 100 repositories,
-ten languages each, the typo left in — and requires it to reproduce the live
-card exactly. That proves the pipeline is right before any fix moves a number.
-A second test then asserts the corrected output.
+No test touches the network. The streak rules run against calendars
+synthesised in code with `today` pinned; the config tests write their
+fixtures into a temp directory; the render tests are table-driven. `-dump`
+and `-from` exist for debugging a card against real data without committing
+any of it.
 
 ## Licence
 

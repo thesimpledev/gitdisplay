@@ -22,18 +22,17 @@ func write(t *testing.T, body string) string {
 func TestLoadAppliesDefaults(t *testing.T) {
 	cfg, err := config.Load(write(t, `{
       "username": "example-user",
-      "timezone": "America/Toronto",
-      "state_dir": "/tmp/gitdisplay"
+      "timezone": "America/Toronto"
     }`))
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if cfg.Languages.TTL.D() != 12*time.Hour {
-		t.Errorf("languages ttl: got %s, want 12h", cfg.Languages.TTL.D())
+	if cfg.LangsMaxAge.D() != time.Hour {
+		t.Errorf("langs_max_age: got %s, want 1h", cfg.LangsMaxAge.D())
 	}
-	if cfg.Streak.TTL.D() != 20*time.Minute {
-		t.Errorf("streak ttl: got %s, want 20m", cfg.Streak.TTL.D())
+	if cfg.StreakMaxAge.D() != 5*time.Minute {
+		t.Errorf("streak_max_age: got %s, want 5m", cfg.StreakMaxAge.D())
 	}
 	// The paging fix is the default; the old behaviour has to be asked for.
 	if cfg.Languages.MaxRepos != 0 {
@@ -56,7 +55,7 @@ func TestLoadAppliesDefaults(t *testing.T) {
 func TestTimezoneMustBeExplicit(t *testing.T) {
 	for _, tz := range []string{"", "Local", "Mars/Olympus"} {
 		_, err := config.Load(write(t, `{
-          "username": "x", "state_dir": "/tmp/x", "timezone": "`+tz+`"
+          "username": "x", "timezone": "`+tz+`"
         }`))
 		if err == nil {
 			t.Errorf("timezone %q should be rejected", tz)
@@ -66,13 +65,12 @@ func TestTimezoneMustBeExplicit(t *testing.T) {
 
 func TestRequiredFields(t *testing.T) {
 	cases := map[string]string{
-		"missing username":  `{"timezone": "UTC", "state_dir": "/tmp/x"}`,
-		"missing state dir": `{"username": "x", "timezone": "UTC", "state_dir": ""}`,
-		"both cards off": `{"username":"x","timezone":"UTC","state_dir":"/tmp/x",
+		"missing username": `{"timezone": "UTC"}`,
+		"both cards off": `{"username":"x","timezone":"UTC",
             "languages":{"enabled":false},"streak":{"enabled":false}}`,
-		"zero count": `{"username":"x","timezone":"UTC","state_dir":"/tmp/x",
+		"zero count": `{"username":"x","timezone":"UTC",
             "languages":{"count":0}}`,
-		"bad weekday": `{"username":"x","timezone":"UTC","state_dir":"/tmp/x",
+		"bad weekday": `{"username":"x","timezone":"UTC",
             "streak":{"exclude_days":["Funday"]}}`,
 	}
 	for name, body := range cases {
@@ -86,7 +84,7 @@ func TestRequiredFields(t *testing.T) {
 // rather than a setting that silently does nothing.
 func TestUnknownFieldIsRejected(t *testing.T) {
 	_, err := config.Load(write(t, `{
-      "username": "x", "timezone": "UTC", "state_dir": "/tmp/x",
+      "username": "x", "timezone": "UTC",
       "languages": {"exclude_repo": ["typo-in-the-key"]}
     }`))
 	if err == nil {
@@ -99,31 +97,31 @@ func TestUnknownFieldIsRejected(t *testing.T) {
 
 func TestDurationParsing(t *testing.T) {
 	cfg, err := config.Load(write(t, `{
-      "username": "x", "timezone": "UTC", "state_dir": "/tmp/x",
-      "languages": {"ttl": "6h"}, "streak": {"ttl": "90s"}
+      "username": "x", "timezone": "UTC",
+      "langs_max_age": "6h", "streak_max_age": "90s"
     }`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Languages.TTL.D() != 6*time.Hour {
-		t.Errorf("got %s, want 6h", cfg.Languages.TTL.D())
+	if cfg.LangsMaxAge.D() != 6*time.Hour {
+		t.Errorf("got %s, want 6h", cfg.LangsMaxAge.D())
 	}
-	if cfg.Streak.TTL.D() != 90*time.Second {
-		t.Errorf("got %s, want 90s", cfg.Streak.TTL.D())
+	if cfg.StreakMaxAge.D() != 90*time.Second {
+		t.Errorf("got %s, want 90s", cfg.StreakMaxAge.D())
 	}
 
 	for _, bad := range []string{`"nonsense"`, `"0s"`, `"-5m"`, `300`} {
 		if _, err := config.Load(write(t, `{
-          "username":"x","timezone":"UTC","state_dir":"/tmp/x",
-          "streak":{"ttl":`+bad+`}}`)); err == nil {
-			t.Errorf("ttl %s should be rejected", bad)
+          "username":"x","timezone":"UTC",
+          "streak_max_age":`+bad+`}`)); err == nil {
+			t.Errorf("streak_max_age %s should be rejected", bad)
 		}
 	}
 }
 
 func TestExcludedWeekdays(t *testing.T) {
 	cfg, err := config.Load(write(t, `{
-      "username":"x","timezone":"UTC","state_dir":"/tmp/x",
+      "username":"x","timezone":"UTC",
       "streak":{"exclude_days":["Sat","sunday"]}}`))
 	if err != nil {
 		t.Fatal(err)
@@ -142,5 +140,24 @@ func TestExcludedWeekdays(t *testing.T) {
 func TestExampleConfigIsValid(t *testing.T) {
 	if _, err := config.Load("../../config.example.json"); err != nil {
 		t.Fatalf("config.example.json does not load: %v", err)
+	}
+}
+
+// TestLoadBytes covers the path-free entry point Lambda mode uses.
+func TestLoadBytes(t *testing.T) {
+	cfg, err := config.LoadBytes([]byte(`{"username":"example-user","timezone":"UTC"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Username != "example-user" {
+		t.Errorf("username: got %q", cfg.Username)
+	}
+	for name, raw := range map[string][]byte{
+		"empty":   nil,
+		"invalid": []byte(`{"username":`),
+	} {
+		if _, err := config.LoadBytes(raw); err == nil {
+			t.Errorf("%s input should be rejected", name)
+		}
 	}
 }
