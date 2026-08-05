@@ -1,0 +1,59 @@
+# Deploys run ONLY on a release tag. Nothing triggers on a branch push.
+# Auth is GitHub OIDC assuming an IAM role; this repo holds zero AWS secrets.
+# The role ARN, region, and function name are GitHub variables: identifiers,
+# not credentials.
+name: deploy
+
+on:
+  push:
+    tags:
+      - 'prod-*'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Gates
+        run: |
+          go vet ./...
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          go install github.com/kisielk/errcheck@latest
+          go install github.com/mgechev/revive@latest
+          staticcheck ./...
+          errcheck ./...
+          revive -set_exit_status ./...
+
+      - name: Tests
+        run: go test ./... -race -vet=all -shuffle=on -count=1
+
+      - name: Build
+        run: make build
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # update-function-code returns the new CodeSha256, so the deploy is
+      # verified from its own response; the role needs no read permissions.
+      - name: Deploy
+        run: |
+          local_sha="$(openssl dgst -sha256 -binary dist/gitdisplay-lambda.zip | base64)"
+          deployed_sha="$(aws lambda update-function-code \
+            --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}" \
+            --zip-file fileb://dist/gitdisplay-lambda.zip \
+            --query CodeSha256 --output text)"
+          echo "local zip sha256:  $local_sha"
+          echo "deployed code sha: $deployed_sha"
+          test "$local_sha" = "$deployed_sha"
