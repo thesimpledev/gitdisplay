@@ -115,10 +115,13 @@ the `-config` flag points at a file). Nothing is read from the query string,
 so the URL in your README never discloses which repositories you skip. Start
 from [`config.example.json`](config.example.json).
 
-The function itself takes only five environment variables: `CONFIG_BUCKET`
-and `CONFIG_KEY` (where the config JSON lives), `CARDS_BUCKET` and
-`CARDS_PREFIX` (where the rendered cards go), and `GITHUB_TOKEN`. A config
-change in S3 takes effect when the execution environment next recycles; any
+The function itself takes only four environment variables, all identifiers:
+`CONFIG_BUCKET` and `CONFIG_KEY` (where the config JSON lives), plus
+`CARDS_BUCKET` and `CARDS_PREFIX` (where the rendered cards go). The GitHub
+token travels inside the config document as `github.token`, so no secret
+ever sits in the function environment; locally the `GITHUB_TOKEN`
+environment variable is the fallback. A config change in S3 takes effect
+when the execution environment next recycles; any
 `update-function-configuration` call forces that immediately.
 
 Selected settings:
@@ -171,7 +174,8 @@ card, or reproduce a bug, without touching the API. Lambda mode is picked
 automatically when `AWS_LAMBDA_RUNTIME_API` is set; there is no serve mode on
 this branch.
 
-`GITHUB_TOKEN` needs `repo` and `read:user`. The only host contacted is
+The token (config `github.token`, or the `GITHUB_TOKEN` environment
+variable) needs `repo` and `read:user`. The only host contacted is
 `api.github.com`.
 
 ## Build

@@ -78,6 +78,12 @@ type GitHub struct {
 	Timeout    Duration `json:"timeout"`
 	MaxRetries int      `json:"max_retries"`
 	UserAgent  string   `json:"user_agent"`
+
+	// Token authenticates the API calls (repo and read:user scopes). When
+	// empty, the GITHUB_TOKEN environment variable is used instead. The
+	// config document lives in a private bucket, never in git, which is
+	// what makes carrying it here acceptable.
+	Token string `json:"token"`
 }
 
 // Languages configures the top-languages card.

@@ -87,9 +87,9 @@ func run() error {
 
 	var client *gh.Client
 	if !offline {
-		token := os.Getenv("GITHUB_TOKEN")
-		if token == "" {
-			return errors.New("GITHUB_TOKEN is not set (needs the repo and read:user scopes)")
+		token, err := githubToken(cfg)
+		if err != nil {
+			return err
 		}
 		client = gh.New(cfg.GitHub.Endpoint, token, cfg.GitHub.UserAgent,
 			cfg.GitHub.Timeout.D(), cfg.GitHub.MaxRetries)
@@ -110,6 +110,19 @@ type app struct {
 	cfg    config.Config
 	client *gh.Client
 	now    time.Time
+}
+
+// githubToken prefers the config document (the source of truth between
+// deploys) and falls back to the environment for local runs.
+func githubToken(cfg config.Config) (string, error) {
+	token := strings.TrimSpace(cfg.GitHub.Token)
+	if token == "" {
+		token = strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
+	}
+	if token == "" {
+		return "", errors.New("no GitHub token: set github.token in the config or GITHUB_TOKEN in the environment (repo and read:user scopes)")
+	}
+	return token, nil
 }
 
 // ---------------------------------------------------------------------------

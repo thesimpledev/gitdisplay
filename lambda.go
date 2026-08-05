@@ -29,13 +29,14 @@ import (
 	"github.com/thesimpledev/gitdisplay/internal/stats"
 )
 
-// lambdaEnv is everything Lambda mode takes from the environment.
+// lambdaEnv is everything Lambda mode takes from the environment: object
+// locations only, all identifiers. The GitHub token travels inside the
+// config document, never through the function environment.
 type lambdaEnv struct {
 	configBucket string
 	configKey    string
 	cardsBucket  string
 	cardsPrefix  string
-	token        string
 }
 
 // readLambdaEnv collects the required variables. Everything else about a run
@@ -50,7 +51,6 @@ func readLambdaEnv() (lambdaEnv, error) {
 		{"CONFIG_KEY", &env.configKey},
 		{"CARDS_BUCKET", &env.cardsBucket},
 		{"CARDS_PREFIX", &env.cardsPrefix},
-		{"GITHUB_TOKEN", &env.token},
 	} {
 		val := strings.TrimSpace(os.Getenv(v.name))
 		if val == "" {
@@ -82,7 +82,11 @@ func runLambda() error {
 		return err
 	}
 
-	client := gh.New(cfg.GitHub.Endpoint, env.token, cfg.GitHub.UserAgent,
+	token, err := githubToken(cfg)
+	if err != nil {
+		return err
+	}
+	client := gh.New(cfg.GitHub.Endpoint, token, cfg.GitHub.UserAgent,
 		cfg.GitHub.Timeout.D(), cfg.GitHub.MaxRetries)
 
 	p := &publisher{cfg: cfg, client: client, s3: s3c,

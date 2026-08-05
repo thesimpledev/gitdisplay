@@ -8,7 +8,8 @@
     "endpoint": "https://api.github.com/graphql",
     "timeout": "30s",
     "max_retries": 4,
-    "user_agent": "gitdisplay/1.0"
+    "user_agent": "gitdisplay/1.0",
+    "token": ""
   },
 
   "languages": {
