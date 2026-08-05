@@ -103,7 +103,7 @@ func run() error {
 	if offline {
 		return errors.New("-from only applies to -once or -dump")
 	}
-	return errors.New("nothing to do: use -once or -dump (server mode lives on the ec2-deploy branch)")
+	return errors.New("nothing to do: use -once or -dump (server mode was removed in the Lambda migration)")
 }
 
 type app struct {

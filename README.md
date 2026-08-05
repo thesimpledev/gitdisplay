@@ -5,8 +5,8 @@ streak. A Go 1.26 program that an AWS Lambda function runs every 20 minutes;
 it fetches from GitHub, renders both cards, and uploads them to S3, where
 CloudFront serves them as static files.
 
-Two branches: `master` is the Lambda version described here; `ec2-deploy`
-holds the earlier self-hosted HTTPS server exactly as it ran on EC2.
+The earlier self-hosted HTTPS server version lives in this repository's
+history; commit 751a024 is the last state that ran on EC2.
 
 ```
 ┌─ Most Used Languages ────────────────────────────────┐
