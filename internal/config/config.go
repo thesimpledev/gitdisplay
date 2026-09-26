@@ -94,9 +94,9 @@ type Languages struct {
 	// Count is how many languages appear on the card.
 	Count int `json:"count"`
 
-	// SplitArchived renders one card in two sections: active repositories on
-	// top, archived ones underneath. It is a look at what you work on now
-	// against what you used to.
+	// SplitArchived renders one card in two columns: active repositories on
+	// the left, archived ones on the right. It is a look at what you work on
+	// now against what you used to.
 	//
 	// Each section is ranked and given percentages against itself, so the
 	// archived half is read on its own terms rather than being swamped by the
@@ -182,8 +182,8 @@ type Languages struct {
 	// each file belongs to, and subtracts that from the repository's totals.
 	//
 	// The result is an approximation of what GitHub's own linguist would
-	// have counted. Every subtraction is written to stderr and to /healthz
-	// so you can check it. Where you need an exact number, use
+	// have counted. Every subtraction is logged on every run so you can
+	// check it. Where you need an exact number, use
 	// ByteOverrides instead.
 	ExcludePaths map[string][]string `json:"exclude_paths"`
 

@@ -112,8 +112,7 @@ type Client struct {
 }
 
 // New builds a client. The http.Client is given an explicit transport with a
-// small connection pool; this runs on a 512 MB box and only ever talks to one
-// host.
+// small connection pool; a run is a handful of calls to one host.
 func New(endpoint, token, userAgent string, timeout time.Duration, maxRetries int) *Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConns = 4
