@@ -18,10 +18,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
+      # No module cache on a release build: a poisoned cache entry would
+      # otherwise reach the deployed binary.
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
+          cache: false
 
       - name: Gates
         run: |
@@ -48,10 +53,12 @@ jobs:
       # update-function-code returns the new CodeSha256, so the deploy is
       # verified from its own response; the role needs no read permissions.
       - name: Deploy
+        env:
+          LAMBDA_FUNCTION_NAME: ${{ vars.LAMBDA_FUNCTION_NAME }}
         run: |
           local_sha="$(openssl dgst -sha256 -binary dist/gitdisplay-lambda.zip | base64)"
           deployed_sha="$(aws lambda update-function-code \
-            --function-name "${{ vars.LAMBDA_FUNCTION_NAME }}" \
+            --function-name "$LAMBDA_FUNCTION_NAME" \
             --zip-file fileb://dist/gitdisplay-lambda.zip \
             --query CodeSha256 --output text)"
           echo "local zip sha256:  $local_sha"
