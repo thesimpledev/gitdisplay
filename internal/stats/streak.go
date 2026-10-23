@@ -2,7 +2,6 @@ package stats
 
 import (
 	"fmt"
-	"sort"
 	"time"
 
 	"github.com/thesimpledev/gitdisplay/internal/config"
@@ -40,60 +39,20 @@ const dateLayout = "2006-01-02"
 // now is the reference time; only its date in loc matters.
 func Streaks(data *gh.Data, cfg config.Streak, loc *time.Location, now time.Time) StreakResult {
 	today := truncateDay(now.In(loc), loc)
-	res := StreakResult{Today: today}
+	res := StreakResult{Today: today, Years: yearsFrom(data.ContributionYears, cfg.StartYear)}
 
-	// start_year is applied here as well as at fetch time, so replaying a
-	// dump that holds every year still honours the configured window.
-	// Left at 0 every year GitHub reported is used, which is the point:
-	// the account creation year is not the first year with contributions.
-	for _, y := range data.ContributionYears {
-		if cfg.StartYear == 0 || y >= cfg.StartYear {
-			res.Years = append(res.Years, y)
-		}
-	}
+	counts, warnings := dedupeDays(data.Calendars, cfg.StartYear)
+	res.Warnings = warnings
 
-	// GitHub pads each yearly calendar out to whole weeks, so the first and
-	// last weeks of a year carry days that belong to the neighbouring year.
-	// Consecutive years therefore overlap, and summing the calendars as
-	// returned double-counts those days. Deduplicate by date.
-	counts := make(map[string]int, 512)
-	var duplicates int
-	for _, cal := range data.Calendars {
-		if cfg.StartYear > 0 && cal.Year < cfg.StartYear {
-			continue
-		}
-		for _, day := range cal.Days {
-			if existing, seen := counts[day.Date]; seen {
-				duplicates++
-				// Identical values are the normal overlap. A genuine
-				// disagreement is worth surfacing.
-				if existing != day.Count {
-					res.Warnings = append(res.Warnings, fmt.Sprintf(
-						"contribution calendars disagree for %s (%d and %d); keeping the larger",
-						day.Date, existing, day.Count))
-					if day.Count > existing {
-						counts[day.Date] = day.Count
-					}
-				}
-				continue
-			}
-			counts[day.Date] = day.Count
-		}
-	}
-
-	dates := make([]string, 0, len(counts))
-	for d := range counts {
-		dates = append(dates, d)
-	}
-	sort.Strings(dates)
+	dates := sortedKeys(counts)
 	res.DaysConsidered = len(dates)
 
-	excluded := cfg.ExcludedWeekdays()
-
-	current := Streak{Start: today, End: today}
-	longest := Streak{Start: today, End: today}
-	var firstContribution time.Time
-
+	w := streakWalker{
+		today:    today,
+		excluded: cfg.ExcludedWeekdays(),
+		current:  Streak{Start: today, End: today},
+		longest:  Streak{Start: today, End: today},
+	}
 	for _, ds := range dates {
 		day, err := time.ParseInLocation(dateLayout, ds, loc)
 		if err != nil {
@@ -104,58 +63,122 @@ func Streaks(data *gh.Data, cfg config.Streak, loc *time.Location, now time.Time
 		if day.After(today) {
 			break
 		}
+		w.step(day, counts[ds])
+	}
 
-		count := counts[ds]
-		res.TotalContributions += count
+	res.TotalContributions = w.total
+	res.FirstContribution = w.first
+	res.Current = w.current
+	res.Longest = w.longest
+	res.Warnings = append(res.Warnings, streakConfigWarnings(data, cfg)...)
+	return res
+}
 
-		switch {
-		case count > 0:
-			current.Length++
-			current.End = day
-			if current.Length == 1 {
-				current.Start = day
-			}
-			if firstContribution.IsZero() {
-				firstContribution = day
-			}
-			if current.Length > longest.Length {
-				longest = current
-			}
-
-		case excluded != nil && excluded[day.Weekday()]:
-			// An excluded day extends a streak that is already running but
-			// never starts one, and never breaks one.
-			if current.Length > 0 {
-				current.Length++
-				current.End = day
-				if current.Length > longest.Length {
-					longest = current
-				}
-			}
-
-		case day.Equal(today):
-			// A day with no contributions yet must not break the streak.
-			// Without this the card reads zero every morning until the first
-			// commit of the day lands.
-
-		default:
-			current = Streak{Start: today, End: today, Length: 0}
+// yearsFrom applies start_year here as well as at fetch time, so replaying
+// a dump that holds every year still honours the configured window. Left at
+// 0 every year GitHub reported is used, which is the point: the account
+// creation year is not the first year with contributions.
+func yearsFrom(years []int, startYear int) []int {
+	var out []int
+	for _, y := range years {
+		if startYear == 0 || y >= startYear {
+			out = append(out, y)
 		}
 	}
+	return out
+}
 
-	res.FirstContribution = firstContribution
-	res.Current = current
-	res.Longest = longest
+// dedupeDays merges the yearly calendars into one count per date.
+//
+// GitHub pads each yearly calendar out to whole weeks, so the first and last
+// weeks of a year carry days that belong to the neighbouring year.
+// Consecutive years therefore overlap, and summing the calendars as returned
+// double-counts those days.
+func dedupeDays(calendars []gh.Calendar, startYear int) (map[string]int, []string) {
+	counts := make(map[string]int, 512)
+	var warnings []string
+	for _, cal := range calendars {
+		if startYear > 0 && cal.Year < startYear {
+			continue
+		}
+		for _, day := range cal.Days {
+			existing, seen := counts[day.Date]
+			if !seen {
+				counts[day.Date] = day.Count
+				continue
+			}
+			// Identical values are the normal overlap. A genuine
+			// disagreement is worth surfacing.
+			if existing == day.Count {
+				continue
+			}
+			warnings = append(warnings, fmt.Sprintf(
+				"contribution calendars disagree for %s (%d and %d); keeping the larger",
+				day.Date, existing, day.Count))
+			counts[day.Date] = max(existing, day.Count)
+		}
+	}
+	return counts, warnings
+}
 
+// streakWalker applies the streak rules one day at a time, in date order.
+type streakWalker struct {
+	today    time.Time
+	excluded map[time.Weekday]bool
+	total    int
+	first    time.Time
+	current  Streak
+	longest  Streak
+}
+
+func (w *streakWalker) step(day time.Time, count int) {
+	w.total += count
+	switch {
+	case count > 0:
+		if w.first.IsZero() {
+			w.first = day
+		}
+		if w.current.Length == 0 {
+			w.current.Start = day
+		}
+		w.extend(day)
+
+	case w.excluded[day.Weekday()]:
+		// An excluded day extends a streak that is already running but
+		// never starts one, and never breaks one.
+		if w.current.Length > 0 {
+			w.extend(day)
+		}
+
+	case day.Equal(w.today):
+		// A day with no contributions yet must not break the streak.
+		// Without this the card reads zero every morning until the first
+		// commit of the day lands.
+
+	default:
+		w.current = Streak{Start: w.today, End: w.today, Length: 0}
+	}
+}
+
+func (w *streakWalker) extend(day time.Time) {
+	w.current.Length++
+	w.current.End = day
+	if w.current.Length > w.longest.Length {
+		w.longest = w.current
+	}
+}
+
+func streakConfigWarnings(data *gh.Data, cfg config.Streak) []string {
+	var warnings []string
 	if len(data.Calendars) == 0 {
-		res.Warnings = append(res.Warnings, "no contribution calendars were fetched")
+		warnings = append(warnings, "no contribution calendars were fetched")
 	}
 	if cfg.StartYear > 0 && len(data.ContributionYears) > 0 && cfg.StartYear > data.ContributionYears[0] {
-		res.Warnings = append(res.Warnings, fmt.Sprintf(
+		warnings = append(warnings, fmt.Sprintf(
 			"streak.start_year is %d, which drops contribution years GitHub reported starting at %d",
 			cfg.StartYear, data.ContributionYears[0]))
 	}
-	return res
+	return warnings
 }
 
 func truncateDay(t time.Time, loc *time.Location) time.Time {

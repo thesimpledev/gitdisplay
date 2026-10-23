@@ -1,0 +1,133 @@
+{
+  "fetched_at": "2026-03-10T14:00:00Z",
+  "username": "example-user",
+  "user_created_at": "2014-05-01T00:00:00Z",
+  "timezone": "America/New_York",
+  "contribution_years": [2024, 2025, 2026],
+  "repositories": [
+    {
+      "name": "alpha", "owner": "example-user", "name_with_owner": "example-user/alpha",
+      "private": false, "archived": false,
+      "languages": [
+        {"name": "Go", "color": "#00ADD8", "size": 50000},
+        {"name": "TSQL", "color": "#e38c00", "size": 3000},
+        {"name": "HTML", "color": "#e34c26", "size": 2000}
+      ]
+    },
+    {
+      "name": "beta", "owner": "example-user", "name_with_owner": "example-user/beta",
+      "private": true, "archived": false,
+      "languages": [
+        {"name": "TypeScript", "color": "#3178c6", "size": 30000},
+        {"name": "JavaScript", "color": "#f1e05a", "size": 8000},
+        {"name": "CSS", "color": "#563d7c", "size": 1000}
+      ]
+    },
+    {
+      "name": "gamma", "owner": "example-user", "name_with_owner": "example-user/gamma",
+      "private": false, "archived": true,
+      "languages": [
+        {"name": "PHP", "color": "#4F5D95", "size": 40000},
+        {"name": "JavaScript", "color": "#f1e05a", "size": 10000},
+        {"name": "Hack", "color": "#878787", "size": 2000}
+      ]
+    },
+    {
+      "name": "delta", "owner": "example-user", "name_with_owner": "example-user/delta",
+      "private": false, "archived": false,
+      "languages": [
+        {"name": "Rust", "color": "#dea584", "size": 20000},
+        {"name": "PLpgSQL", "color": "#336790", "size": 1500}
+      ]
+    },
+    {
+      "name": "epsilon", "owner": "some-org", "name_with_owner": "some-org/epsilon",
+      "private": false, "archived": false,
+      "languages": [
+        {"name": "Kotlin", "color": "#A97BFF", "size": 9000},
+        {"name": "Go", "color": "#00ADD8", "size": 1000}
+      ]
+    },
+    {
+      "name": "zeta", "owner": "example-user", "name_with_owner": "example-user/zeta",
+      "private": false, "archived": true,
+      "languages": [
+        {"name": "JavaScript", "color": "#f1e05a", "size": 60000}
+      ]
+    },
+    {
+      "name": "eta", "owner": "example-user", "name_with_owner": "example-user/eta",
+      "private": false, "archived": false,
+      "languages": [
+        {"name": "Python", "color": "#3572A5", "size": 5000}
+      ]
+    },
+    {
+      "name": "theta", "owner": "example-user", "name_with_owner": "example-user/theta",
+      "private": false, "archived": false,
+      "languages": [
+        {"name": "Python", "color": "#3572A5", "size": 700},
+        {"name": "Lua", "color": "#000080", "size": 300},
+        {"name": "Elixir", "color": "#6e4a7e", "size": 200}
+      ]
+    },
+    {
+      "name": "iota", "owner": "example-user", "name_with_owner": "example-user/iota",
+      "private": false, "archived": false,
+      "languages": []
+    }
+  ],
+  "calendars": [
+    {"year": 2024, "days": [
+      {"date": "2024-12-28", "count": 2},
+      {"date": "2024-12-29", "count": 0},
+      {"date": "2024-12-30", "count": 3},
+      {"date": "2024-12-31", "count": 1}
+    ]},
+    {"year": 2025, "days": [
+      {"date": "2024-12-30", "count": 3},
+      {"date": "2024-12-31", "count": 2},
+      {"date": "2025-01-01", "count": 4},
+      {"date": "2025-01-02", "count": 0},
+      {"date": "2025-06-01", "count": 5},
+      {"date": "2025-12-31", "count": 1}
+    ]},
+    {"year": 2026, "days": [
+      {"date": "2026-03-05", "count": 1},
+      {"date": "2026-03-06", "count": 2},
+      {"date": "2026-03-07", "count": 0},
+      {"date": "2026-03-08", "count": 0},
+      {"date": "2026-03-09", "count": 3},
+      {"date": "2026-03-10", "count": 0},
+      {"date": "2026-03-11", "count": 7}
+    ]}
+  ],
+  "trees": [
+    {
+      "repo": "gamma", "truncated": false,
+      "prefixes": ["missing/", "themes/bought/"],
+      "files": [
+        {"path": "themes/bought/index.php", "size": 12000, "language": "PHP"},
+        {"path": "themes/bought/partial.php", "size": 1500, "language": "Hack"},
+        {"path": "themes/bought/app.js", "size": 4000},
+        {"path": "themes/bought/vendor/lib.js", "size": 900},
+        {"path": "themes/bought/app.min.js", "size": 800},
+        {"path": "themes/bought/README.md", "size": 300}
+      ]
+    },
+    {
+      "repo": "theta", "truncated": true,
+      "prefixes": ["lib/"],
+      "files": [
+        {"path": "lib/big.lua", "size": 400}
+      ]
+    },
+    {
+      "repo": "alpha", "truncated": false,
+      "prefixes": ["dist/"],
+      "files": [
+        {"path": "dist/app.js", "size": 500}
+      ]
+    }
+  ]
+}

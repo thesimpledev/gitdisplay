@@ -95,53 +95,13 @@ func aggregate(data *gh.Data, cfg config.Languages, include func(gh.Repo) bool, 
 		repos = repos[:cfg.MaxRepos]
 	}
 
-	// An exclusion matches either the bare name or the qualified owner/name.
-	excluded := make(map[string]bool, len(cfg.ExcludeRepos))
-	for _, name := range cfg.ExcludeRepos {
-		excluded[name] = true
-	}
-	isExcluded := func(r gh.Repo) bool {
-		return excluded[r.Name] || (r.NameWithOwner != "" && excluded[r.NameWithOwner])
-	}
-
 	subtractions, subByRepo := pathSubtractions(data, cfg)
 	res.Subtractions = subtractions
 
-	// Aliases merge one language into another before ranking, so the SQL
-	// dialects GitHub reports separately can share a row.
-	aliases := make(map[string]string, len(cfg.LanguageAliases))
-	for from, to := range cfg.LanguageAliases {
-		aliases[strings.ToLower(strings.TrimSpace(from))] = strings.TrimSpace(to)
-	}
-
-	hidden := make(map[string]bool, len(cfg.HideLanguages))
-	for _, name := range cfg.HideLanguages {
-		hidden[strings.ToLower(strings.TrimSpace(name))] = true
-	}
-
-	// Language name -> accumulated bytes. Names are kept in the casing GitHub
-	// uses; lookups are case-insensitive.
-	type acc struct {
-		name  string
-		color string
-		// largest is the biggest single contribution seen, so a merged row
-		// takes the colour of whichever source dominates it.
-		largest int64
-		size    int64
-	}
-	totals := map[string]*acc{}
-	seenLangs := map[string]bool{}
-
+	t := newTally(cfg, subByRepo)
 	for _, repo := range repos {
-		// Record which languages exist anywhere in the fetched data before
-		// any filtering. A hide entry for a language that only appears in
-		// archived repositories is still doing its job, so it must not be
-		// reported as matching nothing.
-		for _, lang := range repo.Languages {
-			seenLangs[strings.ToLower(lang.Name)] = true
-		}
-
-		if isExcluded(repo) {
+		t.noteLanguages(repo)
+		if t.isExcluded(repo) {
 			continue
 		}
 		if !include(repo) {
@@ -150,70 +110,151 @@ func aggregate(data *gh.Data, cfg config.Languages, include func(gh.Repo) bool, 
 			}
 			continue
 		}
-
-		langs := repo.Languages
-		// LanguagesPerRepo reproduces the original's languages(first: 10),
-		// which lost the tail. The API returns them largest first.
-		if cfg.LanguagesPerRepo > 0 && len(langs) > cfg.LanguagesPerRepo {
-			langs = langs[:cfg.LanguagesPerRepo]
-		}
-		if len(langs) == 0 {
-			continue
-		}
-		res.ReposConsidered++
-
-		overrides := lowerKeys(cfg.ByteOverrides[repo.Name])
-		subs := subByRepo[repo.Name]
-
-		for _, lang := range langs {
-			key := strings.ToLower(lang.Name)
-			seenLangs[key] = true
-
-			// Resolve the alias, then hide on either the reported name or
-			// the name it merged into.
-			display := lang.Name
-			if to, ok := aliases[key]; ok && to != "" {
-				display = to
-			}
-			if hidden[key] || hidden[strings.ToLower(display)] {
-				continue
-			}
-
-			size := lang.Size
-			if sub, ok := subs[key]; ok {
-				size -= sub
-				if size < 0 {
-					size = 0
-				}
-			}
-			// A manual override is the exact escape hatch and wins over any
-			// computed path subtraction.
-			if v, ok := overrides[key]; ok {
-				size = v
-			}
-			if size <= 0 {
-				continue
-			}
-
-			mergedKey := strings.ToLower(display)
-			a := totals[mergedKey]
-			if a == nil {
-				a = &acc{name: display}
-				totals[mergedKey] = a
-			}
-			if size > a.largest {
-				a.largest, a.color = size, lang.Color
-			}
-			a.size += size
+		if t.addRepo(repo) {
+			res.ReposConsidered++
 		}
 	}
 
+	res.Languages, res.DisplayedBytes = t.rank()
+	if withWarnings {
+		res.Warnings = validateLanguages(data, cfg, t.seen)
+	}
+	return res
+}
+
+// langAcc is one row being accumulated. Names keep the casing GitHub uses;
+// lookups are case-insensitive.
+type langAcc struct {
+	name  string
+	color string
+	// largest is the biggest single contribution seen, so a merged row
+	// takes the colour of whichever source dominates it.
+	largest int64
+	size    int64
+}
+
+// tally accumulates language bytes across repositories under one config.
+type tally struct {
+	cfg       config.Languages
+	excluded  map[string]bool
+	aliases   map[string]string
+	hidden    map[string]bool
+	subByRepo map[string]map[string]int64
+	totals    map[string]*langAcc
+	// seen records every language present in the fetched data before any
+	// filtering, for the hide_languages check.
+	seen map[string]bool
+}
+
+func newTally(cfg config.Languages, subByRepo map[string]map[string]int64) *tally {
+	t := &tally{
+		cfg:       cfg,
+		excluded:  make(map[string]bool, len(cfg.ExcludeRepos)),
+		aliases:   make(map[string]string, len(cfg.LanguageAliases)),
+		hidden:    make(map[string]bool, len(cfg.HideLanguages)),
+		subByRepo: subByRepo,
+		totals:    map[string]*langAcc{},
+		seen:      map[string]bool{},
+	}
+	for _, name := range cfg.ExcludeRepos {
+		t.excluded[name] = true
+	}
+	// Aliases merge one language into another before ranking, so the SQL
+	// dialects GitHub reports separately can share a row.
+	for from, to := range cfg.LanguageAliases {
+		t.aliases[strings.ToLower(strings.TrimSpace(from))] = strings.TrimSpace(to)
+	}
+	for _, name := range cfg.HideLanguages {
+		t.hidden[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	return t
+}
+
+// noteLanguages runs before any filtering. A hide entry for a language that
+// only appears in archived repositories is still doing its job, so it must
+// not be reported as matching nothing.
+func (t *tally) noteLanguages(repo gh.Repo) {
+	for _, lang := range repo.Languages {
+		t.seen[strings.ToLower(lang.Name)] = true
+	}
+}
+
+// isExcluded matches either the bare name or the qualified owner/name.
+func (t *tally) isExcluded(r gh.Repo) bool {
+	return t.excluded[r.Name] || (r.NameWithOwner != "" && t.excluded[r.NameWithOwner])
+}
+
+// addRepo adds one repository's languages and reports whether it had any.
+func (t *tally) addRepo(repo gh.Repo) bool {
+	langs := repo.Languages
+	// LanguagesPerRepo reproduces the original's languages(first: 10),
+	// which lost the tail. The API returns them largest first.
+	if t.cfg.LanguagesPerRepo > 0 && len(langs) > t.cfg.LanguagesPerRepo {
+		langs = langs[:t.cfg.LanguagesPerRepo]
+	}
+	if len(langs) == 0 {
+		return false
+	}
+	overrides := lowerKeys(t.cfg.ByteOverrides[repo.Name])
+	subs := t.subByRepo[repo.Name]
+	for _, lang := range langs {
+		t.addLang(lang, subs, overrides)
+	}
+	return true
+}
+
+func (t *tally) addLang(lang gh.Lang, subs, overrides map[string]int64) {
+	key := strings.ToLower(lang.Name)
+	t.seen[key] = true
+
+	// Resolve the alias, then hide on either the reported name or the name
+	// it merged into.
+	display := lang.Name
+	if to, ok := t.aliases[key]; ok && to != "" {
+		display = to
+	}
+	mergedKey := strings.ToLower(display)
+	if t.hidden[key] || t.hidden[mergedKey] {
+		return
+	}
+
+	size := adjustedSize(lang.Size, key, subs, overrides)
+	if size <= 0 {
+		return
+	}
+
+	a := t.totals[mergedKey]
+	if a == nil {
+		a = &langAcc{name: display}
+		t.totals[mergedKey] = a
+	}
+	if size > a.largest {
+		a.largest, a.color = size, lang.Color
+	}
+	a.size += size
+}
+
+// adjustedSize applies a path subtraction and then any manual override. The
+// override is the exact escape hatch and wins over a computed subtraction.
+func adjustedSize(size int64, key string, subs, overrides map[string]int64) int64 {
+	if sub, ok := subs[key]; ok {
+		size = max(size-sub, 0)
+	}
+	if v, ok := overrides[key]; ok {
+		size = v
+	}
+	return size
+}
+
+// rank orders the accumulated rows, keeps the top Count, and works out the
+// percentages. It returns the rows and the denominator used.
+func (t *tally) rank() ([]LangStat, int64) {
 	// Hiding happens before the top-N cut, so a hidden language never uses up
 	// one of the displayed slots.
-	visible := make([]LangStat, 0, len(totals))
+	visible := make([]LangStat, 0, len(t.totals))
 	var visibleBytes int64
-	for key, a := range totals {
-		if hidden[key] {
+	for key, a := range t.totals {
+		if t.hidden[key] {
 			continue
 		}
 		visible = append(visible, LangStat{Name: a.name, Color: a.color, Size: a.size})
@@ -227,82 +268,104 @@ func aggregate(data *gh.Data, cfg config.Languages, include func(gh.Repo) bool, 
 		return visible[i].Name < visible[j].Name
 	})
 
-	if cfg.Count > 0 && len(visible) > cfg.Count {
-		visible = visible[:cfg.Count]
-	}
-
-	var displayed int64
-	for _, l := range visible {
-		displayed += l.Size
+	if t.cfg.Count > 0 && len(visible) > t.cfg.Count {
+		visible = visible[:t.cfg.Count]
 	}
 
 	// The denominator is the sum of the displayed languages, so the card adds
 	// up to 100%. Set percent_of_displayed to false to divide by every
 	// non-hidden language instead.
-	denom := displayed
-	if !cfg.PercentOfDisplayed {
-		denom = visibleBytes
+	denom := visibleBytes
+	if t.cfg.PercentOfDisplayed {
+		denom = 0
+		for _, l := range visible {
+			denom += l.Size
+		}
 	}
 	if denom > 0 {
 		for i := range visible {
 			visible[i].Percent = float64(visible[i].Size) / float64(denom) * 100
 		}
 	}
+	return visible, denom
+}
 
-	res.Languages = visible
-	res.DisplayedBytes = denom
-	if withWarnings {
-		res.Warnings = validateLanguages(data, cfg, repos, seenLangs)
+// repoIndex answers the lookups the config checks need.
+type repoIndex struct {
+	// names holds every bare and qualified name. Repositories beyond
+	// MaxRepos still exist; naming one is not a typo.
+	names    map[string]bool
+	archived map[string]bool
+	langs    map[string]map[string]bool
+	trees    map[string]*gh.RepoTree
+}
+
+func newRepoIndex(data *gh.Data) repoIndex {
+	idx := repoIndex{
+		names:    make(map[string]bool, len(data.Repositories)*2),
+		archived: map[string]bool{},
+		langs:    map[string]map[string]bool{},
+		trees:    map[string]*gh.RepoTree{},
 	}
-	return res
+	for _, r := range data.Repositories {
+		idx.names[r.Name] = true
+		if r.NameWithOwner != "" {
+			idx.names[r.NameWithOwner] = true
+		}
+		if r.Archived {
+			idx.archived[r.Name] = true
+		}
+		set := make(map[string]bool, len(r.Languages))
+		for _, l := range r.Languages {
+			set[strings.ToLower(l.Name)] = true
+		}
+		idx.langs[r.Name] = set
+	}
+	for i := range data.Trees {
+		idx.trees[data.Trees[i].Repo] = &data.Trees[i]
+	}
+	return idx
 }
 
 // validateLanguages reports every configured entry that matched nothing.
 //
 // A silent no-op here is how a typo disables an exclusion without anyone
 // noticing, so each list is checked against the data actually fetched.
-func validateLanguages(data *gh.Data, cfg config.Languages, repos []gh.Repo, seenLangs map[string]bool) []string {
+func validateLanguages(data *gh.Data, cfg config.Languages, seenLangs map[string]bool) []string {
+	idx := newRepoIndex(data)
 	var warns []string
+	warns = append(warns, checkExcludeRepos(cfg, idx)...)
+	warns = append(warns, checkHideLanguages(cfg.HideLanguages, seenLangs)...)
+	warns = append(warns, checkByteOverrides(cfg.ByteOverrides, idx)...)
+	warns = append(warns, checkExcludePaths(cfg.ExcludePaths, idx)...)
+	return warns
+}
 
-	repoNames := make(map[string]bool, len(repos))
-	for _, r := range repos {
-		repoNames[r.Name] = true
-	}
-	// Repositories beyond MaxRepos still exist; naming one is not a typo.
-	allRepoNames := make(map[string]bool, len(data.Repositories)*2)
-	for _, r := range data.Repositories {
-		allRepoNames[r.Name] = true
-		if r.NameWithOwner != "" {
-			allRepoNames[r.NameWithOwner] = true
-		}
-	}
-
-	archived := make(map[string]bool)
-	for _, r := range data.Repositories {
-		if r.Archived {
-			archived[r.Name] = true
-		}
-	}
-
+func checkExcludeRepos(cfg config.Languages, idx repoIndex) []string {
+	var warns []string
 	for _, name := range cfg.ExcludeRepos {
 		switch {
 		case strings.TrimSpace(name) == "":
 			warns = append(warns, "languages.exclude_repos: empty entry")
-		case allRepoNames[name]:
+		case idx.names[name]:
 			// Named a real repository. Fine even if MaxRepos cut it off.
 			// Point out entries that exclude_archived already covers, so the
 			// list can shrink to the repositories archiving does not handle.
-			if cfg.ExcludeArchived && archived[name] {
+			if cfg.ExcludeArchived && idx.archived[name] {
 				warns = append(warns, fmt.Sprintf(
 					"languages.exclude_repos: %q is archived and already excluded; the entry is redundant", name))
 			}
 		default:
 			warns = append(warns, fmt.Sprintf(
-				"languages.exclude_repos: %q matches no repository%s", name, nearestRepo(name, allRepoNames)))
+				"languages.exclude_repos: %q matches no repository%s", name, nearestRepo(name, idx.names)))
 		}
 	}
+	return warns
+}
 
-	for _, name := range cfg.HideLanguages {
+func checkHideLanguages(hide []string, seenLangs map[string]bool) []string {
+	var warns []string
+	for _, name := range hide {
 		trimmed := strings.TrimSpace(name)
 		if trimmed == "" {
 			warns = append(warns, "languages.hide_languages: empty entry")
@@ -313,41 +376,36 @@ func validateLanguages(data *gh.Data, cfg config.Languages, repos []gh.Repo, see
 				"languages.hide_languages: %q matches no language in your repositories", name))
 		}
 	}
+	return warns
+}
 
-	langsByRepo := map[string]map[string]bool{}
-	for _, r := range data.Repositories {
-		set := make(map[string]bool, len(r.Languages))
-		for _, l := range r.Languages {
-			set[strings.ToLower(l.Name)] = true
-		}
-		langsByRepo[r.Name] = set
-	}
-
-	for _, repo := range sortedKeys(cfg.ByteOverrides) {
-		if !allRepoNames[repo] {
+func checkByteOverrides(overrides map[string]map[string]int64, idx repoIndex) []string {
+	var warns []string
+	for _, repo := range sortedKeys(overrides) {
+		if !idx.names[repo] {
 			warns = append(warns, fmt.Sprintf(
-				"languages.byte_overrides: repository %q does not exist%s", repo, nearestRepo(repo, allRepoNames)))
+				"languages.byte_overrides: repository %q does not exist%s", repo, nearestRepo(repo, idx.names)))
 			continue
 		}
-		for _, lang := range sortedKeys(cfg.ByteOverrides[repo]) {
-			if !langsByRepo[repo][strings.ToLower(strings.TrimSpace(lang))] {
+		for _, lang := range sortedKeys(overrides[repo]) {
+			if !idx.langs[repo][strings.ToLower(strings.TrimSpace(lang))] {
 				warns = append(warns, fmt.Sprintf(
 					"languages.byte_overrides: %s has no language %q", repo, lang))
 			}
 		}
 	}
+	return warns
+}
 
-	treeByRepo := map[string]*gh.RepoTree{}
-	for i := range data.Trees {
-		treeByRepo[data.Trees[i].Repo] = &data.Trees[i]
-	}
-	for _, repo := range sortedKeys(cfg.ExcludePaths) {
-		if !allRepoNames[repo] {
+func checkExcludePaths(paths map[string][]string, idx repoIndex) []string {
+	var warns []string
+	for _, repo := range sortedKeys(paths) {
+		if !idx.names[repo] {
 			warns = append(warns, fmt.Sprintf(
-				"languages.exclude_paths: repository %q does not exist%s", repo, nearestRepo(repo, allRepoNames)))
+				"languages.exclude_paths: repository %q does not exist%s", repo, nearestRepo(repo, idx.names)))
 			continue
 		}
-		tree := treeByRepo[repo]
+		tree := idx.trees[repo]
 		if tree == nil {
 			warns = append(warns, fmt.Sprintf(
 				"languages.exclude_paths: %s was not read; no paths were subtracted", repo))
@@ -357,27 +415,34 @@ func validateLanguages(data *gh.Data, cfg config.Languages, repos []gh.Repo, see
 			warns = append(warns, fmt.Sprintf(
 				"languages.exclude_paths: %s tree was truncated by the API; subtraction is incomplete", repo))
 		}
-		for _, prefix := range cfg.ExcludePaths[repo] {
-			trimmed := strings.TrimSpace(prefix)
-			if trimmed == "" {
-				warns = append(warns, fmt.Sprintf("languages.exclude_paths: %s has an empty prefix", repo))
-				continue
-			}
-			matched := false
-			for _, f := range tree.Files {
-				if matchesOnePrefix(f.Path, trimmed) {
-					matched = true
-					break
-				}
-			}
-			if !matched {
-				warns = append(warns, fmt.Sprintf(
-					"languages.exclude_paths: %s prefix %q matches no file", repo, prefix))
-			}
+		warns = append(warns, checkPrefixes(repo, paths[repo], tree.Files)...)
+	}
+	return warns
+}
+
+func checkPrefixes(repo string, prefixes []string, files []gh.TreeFile) []string {
+	var warns []string
+	for _, prefix := range prefixes {
+		trimmed := strings.TrimSpace(prefix)
+		if trimmed == "" {
+			warns = append(warns, fmt.Sprintf("languages.exclude_paths: %s has an empty prefix", repo))
+			continue
+		}
+		if !anyFileUnder(files, trimmed) {
+			warns = append(warns, fmt.Sprintf(
+				"languages.exclude_paths: %s prefix %q matches no file", repo, prefix))
 		}
 	}
-
 	return warns
+}
+
+func anyFileUnder(files []gh.TreeFile, prefix string) bool {
+	for _, f := range files {
+		if matchesOnePrefix(f.Path, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // pathSubtractions turns the fetched trees into per-repo, per-language byte
@@ -401,55 +466,69 @@ func pathSubtractions(data *gh.Data, cfg config.Languages) ([]Subtraction, map[s
 
 	byRepo := map[string]map[string]int64{}
 	var out []Subtraction
-
 	for _, tree := range data.Trees {
-		bytesByLang := map[string]int64{}
-		filesByLang := map[string]int{}
-		display := map[string]string{}
-
-		for _, f := range tree.Files {
-			lang := f.Language
-			if lang == "" {
-				lang = languageForPath(f.Path)
-			}
-			if lang == "" {
-				// Not a language GitHub counts towards the bar.
-				continue
-			}
-			if isVendoredPath(f.Path) {
-				// linguist already leaves these out of the totals, so
-				// subtracting them would remove bytes that were never added.
-				continue
-			}
-			key := strings.ToLower(lang)
-			bytesByLang[key] += f.Size
-			filesByLang[key]++
-			display[key] = lang
-		}
-
-		if len(bytesByLang) == 0 {
+		subs := treeSubtractions(tree, reported[tree.Repo])
+		if len(subs) == 0 {
 			continue
 		}
-		byRepo[tree.Repo] = map[string]int64{}
-		for _, key := range sortedKeys(bytesByLang) {
-			want := bytesByLang[key]
-			have := reported[tree.Repo][key]
-			clamped := false
-			if want > have {
-				want = have
-				clamped = true
-			}
-			byRepo[tree.Repo][key] = want
-			out = append(out, Subtraction{
-				Repo:     tree.Repo,
-				Language: display[key],
-				Bytes:    want,
-				Files:    filesByLang[key],
-				Clamped:  clamped,
-			})
+		byRepo[tree.Repo] = make(map[string]int64, len(subs))
+		for _, s := range subs {
+			byRepo[tree.Repo][strings.ToLower(s.Language)] = s.Bytes
 		}
+		out = append(out, subs...)
 	}
 	return out, byRepo
+}
+
+// treeSubtractions sums one tree's counted files by language, capped at what
+// GitHub reported for each language, in language key order.
+func treeSubtractions(tree gh.RepoTree, reported map[string]int64) []Subtraction {
+	bytesByLang := map[string]int64{}
+	filesByLang := map[string]int{}
+	display := map[string]string{}
+	for _, f := range tree.Files {
+		lang := countedLanguage(f)
+		if lang == "" {
+			continue
+		}
+		key := strings.ToLower(lang)
+		bytesByLang[key] += f.Size
+		filesByLang[key]++
+		display[key] = lang
+	}
+
+	out := make([]Subtraction, 0, len(bytesByLang))
+	for _, key := range sortedKeys(bytesByLang) {
+		want := bytesByLang[key]
+		have := reported[key]
+		out = append(out, Subtraction{
+			Repo:     tree.Repo,
+			Language: display[key],
+			Bytes:    min(want, have),
+			Files:    filesByLang[key],
+			Clamped:  want > have,
+		})
+	}
+	return out
+}
+
+// countedLanguage is the language a file adds to GitHub's totals, or "" when
+// it adds nothing.
+func countedLanguage(f gh.TreeFile) string {
+	lang := f.Language
+	if lang == "" {
+		lang = languageForPath(f.Path)
+	}
+	if lang == "" {
+		// Not a language GitHub counts towards the bar.
+		return ""
+	}
+	if isVendoredPath(f.Path) {
+		// linguist already leaves these out of the totals, so subtracting
+		// them would remove bytes that were never added.
+		return ""
+	}
+	return lang
 }
 
 func matchesOnePrefix(path, prefix string) bool {

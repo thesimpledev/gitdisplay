@@ -358,49 +358,73 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.Username) == "" {
 		return fmt.Errorf("username is required")
 	}
-	if strings.TrimSpace(c.Timezone) == "" {
-		return fmt.Errorf("timezone is required and must be an IANA name such as \"America/Toronto\"")
-	}
-	loc, err := time.LoadLocation(c.Timezone)
+	loc, err := resolveTimezone(c.Timezone)
 	if err != nil {
-		return fmt.Errorf("timezone %q: %w", c.Timezone, err)
-	}
-	if c.Timezone == "Local" {
-		return fmt.Errorf("timezone must be an explicit IANA name, not %q", c.Timezone)
+		return err
 	}
 	c.loc = loc
 
-	if c.Languages.Count < 1 {
+	if err := c.Languages.validate(); err != nil {
+		return err
+	}
+	if c.GitHub.MaxRetries < 0 {
+		return fmt.Errorf("github.max_retries cannot be negative")
+	}
+	if err := c.Streak.validate(); err != nil {
+		return err
+	}
+	if !c.Languages.Enabled && !c.Streak.Enabled {
+		return fmt.Errorf("both cards are disabled; nothing to render")
+	}
+	return nil
+}
+
+// resolveTimezone loads an explicit IANA zone. "Local" is refused because
+// day boundaries decide streaks and must not follow the host clock.
+func resolveTimezone(name string) (*time.Location, error) {
+	if strings.TrimSpace(name) == "" {
+		return nil, fmt.Errorf("timezone is required and must be an IANA name such as \"America/Toronto\"")
+	}
+	loc, err := time.LoadLocation(name)
+	if err != nil {
+		return nil, fmt.Errorf("timezone %q: %w", name, err)
+	}
+	if name == "Local" {
+		return nil, fmt.Errorf("timezone must be an explicit IANA name, not %q", name)
+	}
+	return loc, nil
+}
+
+func (l Languages) validate() error {
+	if l.Count < 1 {
 		return fmt.Errorf("languages.count must be at least 1")
 	}
-	if c.Languages.LanguagesPerRepo < 1 {
+	if l.LanguagesPerRepo < 1 {
 		return fmt.Errorf("languages.languages_per_repo must be at least 1")
 	}
-	if c.Languages.MaxRepos < 0 {
+	if l.MaxRepos < 0 {
 		return fmt.Errorf("languages.max_repos cannot be negative")
 	}
-	switch strings.ToLower(strings.TrimSpace(c.Languages.Visibility)) {
+	switch strings.ToLower(strings.TrimSpace(l.Visibility)) {
 	case "", "all", "public":
 	default:
-		return fmt.Errorf("languages.visibility must be \"all\" or \"public\", got %q", c.Languages.Visibility)
+		return fmt.Errorf("languages.visibility must be \"all\" or \"public\", got %q", l.Visibility)
 	}
-	for _, a := range c.Languages.OwnerAffiliations {
+	for _, a := range l.OwnerAffiliations {
 		switch strings.ToUpper(strings.TrimSpace(a)) {
 		case "OWNER", "ORGANIZATION_MEMBER", "COLLABORATOR":
 		default:
 			return fmt.Errorf("languages.owner_affiliations: %q is not a GitHub repository affiliation", a)
 		}
 	}
-	if c.GitHub.MaxRetries < 0 {
-		return fmt.Errorf("github.max_retries cannot be negative")
-	}
-	for _, day := range c.Streak.ExcludeDays {
+	return nil
+}
+
+func (s Streak) validate() error {
+	for _, day := range s.ExcludeDays {
 		if _, ok := weekdayByName(day); !ok {
 			return fmt.Errorf("streak.exclude_days: %q is not a weekday name (use Sun, Mon, Tue, Wed, Thu, Fri, Sat)", day)
 		}
-	}
-	if !c.Languages.Enabled && !c.Streak.Enabled {
-		return fmt.Errorf("both cards are disabled; nothing to render")
 	}
 	return nil
 }

@@ -130,22 +130,9 @@ func githubToken(cfg config.Config) (string, error) {
 // ---------------------------------------------------------------------------
 
 func (a *app) runOnce(fromPath, dumpPath, outDir string, writeCards bool) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-
-	var data *gh.Data
-	var err error
-	if fromPath != "" {
-		data, err = gh.LoadDump(fromPath)
-		if err != nil {
-			return err
-		}
-		log.Printf("loaded %s (fetched %s)", fromPath, data.FetchedAt.Format(time.RFC3339))
-	} else {
-		data, err = a.client.Fetch(ctx, a.fetchOptions(a.cfg.Languages.Enabled, a.cfg.Streak.Enabled))
-		if err != nil {
-			return fmt.Errorf("fetch: %w", err)
-		}
+	data, err := a.loadData(fromPath)
+	if err != nil {
+		return err
 	}
 
 	if dumpPath != "" {
@@ -159,7 +146,31 @@ func (a *app) runOnce(fromPath, dumpPath, outDir string, writeCards bool) error 
 	if !writeCards {
 		return nil
 	}
+	return a.writeCardFiles(data, outDir)
+}
 
+// loadData replays a -from dump when one is given and fetches otherwise.
+func (a *app) loadData(fromPath string) (*gh.Data, error) {
+	if fromPath != "" {
+		data, err := gh.LoadDump(fromPath)
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("loaded %s (fetched %s)", fromPath, data.FetchedAt.Format(time.RFC3339))
+		return data, nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	data, err := a.client.Fetch(ctx, a.fetchOptions(a.cfg.Languages.Enabled, a.cfg.Streak.Enabled))
+	if err != nil {
+		return nil, fmt.Errorf("fetch: %w", err)
+	}
+	return data, nil
+}
+
+// writeCardFiles renders every enabled card into outDir.
+func (a *app) writeCardFiles(data *gh.Data, outDir string) error {
 	if err := os.MkdirAll(outDir, 0o755); err != nil { // #nosec G301 -- output directory for publicly published cards; browsable is intended
 		return fmt.Errorf("create %s: %w", outDir, err)
 	}

@@ -43,8 +43,12 @@ func LangsSplit(split stats.SplitResult, cfg config.Languages) []byte {
 	var b strings.Builder
 	b.Grow(1600 + (len(active)+len(archived))*700)
 
-	writeLangHead(&b, cfg, splitCardWidth, height,
-		langsDescription(append(append([]stats.LangStat{}, active...), archived...)), true)
+	writeLangHead(&b, cfg, cardHead{
+		width:    splitCardWidth,
+		height:   height,
+		desc:     langsDescription(append(append([]stats.LangStat{}, active...), archived...)),
+		centered: true,
+	})
 
 	b.WriteString(`<g data-testid="main-card-body" transform="translate(0, 55)">`)
 
@@ -100,7 +104,7 @@ func Langs(res stats.LangResult, cfg config.Languages) []byte {
 	var b strings.Builder
 	b.Grow(1024 + len(langs)*700)
 
-	writeLangHead(&b, cfg, langCardWidth, height, langsDescription(langs), false)
+	writeLangHead(&b, cfg, cardHead{width: langCardWidth, height: height, desc: langsDescription(langs)})
 
 	b.WriteString(`<g data-testid="main-card-body" transform="translate(0, 55)">`)
 	b.WriteString(`<svg data-testid="lang-items" x="25">`)
@@ -109,10 +113,20 @@ func Langs(res stats.LangResult, cfg config.Languages) []byte {
 	return []byte(b.String())
 }
 
+// cardHead is the per-layout part of a languages card header.
+type cardHead struct {
+	width, height int
+	desc          string
+	// centered puts the title over both columns of the split card; the
+	// single-column card keeps the original left alignment.
+	centered bool
+}
+
 // writeLangHead emits the opening tag, styles, background and title shared by
 // both language layouts.
-func writeLangHead(b *strings.Builder, cfg config.Languages, width, height int, desc string, centerTitle bool) {
+func writeLangHead(b *strings.Builder, cfg config.Languages, head cardHead) {
 	theme := cfg.Theme
+	width, height, desc := head.width, head.height, head.desc
 
 	fmt.Fprintf(b, `<svg width="%d" height="%d" viewBox="0 0 %d %d" fill="none" `+
 		`xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="descId">`,
@@ -146,9 +160,7 @@ func writeLangHead(b *strings.Builder, cfg config.Languages, width, height int, 
 		`stroke="%s" width="%d" fill="%s" stroke-opacity="%s"/>`,
 		theme.Border, width-1, theme.Background, strokeOpacity)
 
-	// The split card centres its title over both columns; the single-column
-	// card keeps the original left alignment.
-	if centerTitle {
+	if head.centered {
 		fmt.Fprintf(b, `<g data-testid="card-title" transform="translate(%d, 35)">`+
 			`<g transform="translate(0, 0)">`+
 			`<text x="0" y="0" class="header" data-testid="header" text-anchor="middle">%s</text></g></g>`,

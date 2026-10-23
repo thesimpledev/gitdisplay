@@ -1,0 +1,22 @@
+loaded testdata/golden/dump.json (fetched 2026-03-10T14:00:00Z)
+warning: languages.exclude_repos: "some-org/epsilonx" matches no repository (did you mean "some-org/epsilon"?)
+warning: languages.exclude_repos: empty entry
+warning: languages.hide_languages: "Cobol" matches no language in your repositories
+warning: languages.hide_languages: empty entry
+warning: languages.byte_overrides: delta has no language "Cobol"
+warning: languages.byte_overrides: repository "nosuch" does not exist
+warning: languages.exclude_paths: beta was not read; no paths were subtracted
+warning: languages.exclude_paths: gamma prefix "missing/" matches no file
+warning: languages.exclude_paths: gamma has an empty prefix
+warning: languages.exclude_paths: repository "ghost" does not exist
+warning: languages.exclude_paths: theta tree was truncated by the API; subtraction is incomplete
+path exclusion: gamma removed 1500 bytes of Hack across 1 files
+path exclusion: gamma removed 4000 bytes of JavaScript across 1 files
+path exclusion: gamma removed 12000 bytes of PHP across 1 files
+path exclusion: theta removed 300 bytes of Lua across 1 files (capped at the reported total)
+path exclusion: alpha removed 0 bytes of JavaScript across 1 files (capped at the reported total)
+languages: 5 of 9 repositories contributed, 4 shown
+wrote OUT/top-langs.svg
+warning: contribution calendars disagree for 2024-12-31 (1 and 2); keeping the larger
+streak: total 23, current 1, longest 4, 15 days across 3 years
+wrote OUT/streak.svg

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -109,6 +110,17 @@ type Client struct {
 	UserAgent  string
 	MaxRetries int
 	HTTP       *http.Client
+
+	// after waits between retries; nil means time.After. Tests replace it
+	// so retry paths run without sleeping.
+	after func(time.Duration) <-chan time.Time
+}
+
+func (c *Client) wait(d time.Duration) <-chan time.Time {
+	if c.after != nil {
+		return c.after(d)
+	}
+	return time.After(d)
 }
 
 // New builds a client. The http.Client is given an explicit transport with a
@@ -161,36 +173,50 @@ func (c *Client) query(ctx context.Context, q string, vars map[string]any, out a
 		return fmt.Errorf("encode request: %w", err)
 	}
 
+	return c.retry(ctx, func() error {
+		doErr := c.do(ctx, body, out)
+		if _, ok := errors.AsType[*retryableError](doErr); ok && ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return doErr
+	})
+}
+
+// retry runs attempt until it succeeds, fails with an error that is not
+// retryable, or uses up MaxRetries.
+func (c *Client) retry(ctx context.Context, attempt func() error) error {
 	var lastErr error
-	for attempt := 0; attempt <= c.MaxRetries; attempt++ {
-		if attempt > 0 {
-			delay := backoff(attempt)
-			var re *retryableError
-			if errors.As(lastErr, &re) && re.after > 0 {
-				delay = re.after
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(delay):
+	for n := 0; n <= c.MaxRetries; n++ {
+		if n > 0 {
+			if err := c.pause(ctx, n, lastErr); err != nil {
+				return err
 			}
 		}
-
-		err := c.do(ctx, body, out)
+		err := attempt()
 		if err == nil {
 			return nil
 		}
 		lastErr = err
-
-		var re *retryableError
-		if !errors.As(err, &re) {
+		if _, ok := errors.AsType[*retryableError](err); !ok {
 			return err
-		}
-		if ctx.Err() != nil {
-			return ctx.Err()
 		}
 	}
 	return fmt.Errorf("after %d attempts: %w", c.MaxRetries+1, lastErr)
+}
+
+// pause waits before retry number attempt, preferring the delay the server
+// asked for over the exponential backoff.
+func (c *Client) pause(ctx context.Context, attempt int, lastErr error) error {
+	delay := backoff(attempt)
+	if re, ok := errors.AsType[*retryableError](lastErr); ok && re.after > 0 {
+		delay = re.after
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.wait(delay):
+		return nil
+	}
 }
 
 func (c *Client) do(ctx context.Context, body []byte, out any) error {
@@ -198,65 +224,72 @@ func (c *Client) do(ctx context.Context, body []byte, out any) error {
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.Token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+
+	// Cap the read. A runaway response must not take the box down.
+	resp, payload, err := c.send(req, 32<<20)
+	if err != nil {
+		return err
+	}
+	if err = statusError(resp, payload); err != nil {
+		return err
+	}
+	return decodeGraphQL(payload, out)
+}
+
+// send adds the auth headers, performs the request, and reads at most limit
+// bytes of the body. Transport and read failures are retryable.
+func (c *Client) send(req *http.Request, limit int64) (*http.Response, []byte, error) {
+	req.Header.Set("Authorization", "Bearer "+c.Token)
 	req.Header.Set("User-Agent", c.UserAgent)
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return &retryableError{err: fmt.Errorf("request: %w", err)}
+		return nil, nil, &retryableError{err: fmt.Errorf("request: %w", err)}
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		_ = resp.Body.Close()
 	}()
 
-	// Cap the read. A runaway response must not take the box down.
-	payload, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, limit))
 	if err != nil {
-		return &retryableError{err: fmt.Errorf("read response: %w", err)}
+		return nil, nil, &retryableError{err: fmt.Errorf("read response: %w", err)}
 	}
+	return resp, payload, nil
+}
 
+// statusError maps a non-200 status to an error, retryable where trying
+// again can help. It returns nil for 200.
+func statusError(resp *http.Response, payload []byte) error {
+	code := resp.StatusCode
 	switch {
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+	case code == http.StatusUnauthorized || code == http.StatusForbidden:
 		// 403 with a rate-limit reset is retryable; a bad token is not.
 		if wait, ok := rateLimitWait(resp); ok {
-			return &retryableError{
-				err:   fmt.Errorf("rate limited (HTTP %d)", resp.StatusCode),
-				after: wait,
-			}
+			return &retryableError{err: fmt.Errorf("rate limited (HTTP %d)", code), after: wait}
 		}
-		return fmt.Errorf("github rejected the token (HTTP %d): %s",
-			resp.StatusCode, firstLine(payload))
-	case resp.StatusCode == http.StatusTooManyRequests:
+		return fmt.Errorf("github rejected the token (HTTP %d): %s", code, firstLine(payload))
+	case code == http.StatusTooManyRequests:
 		wait, _ := rateLimitWait(resp)
 		return &retryableError{err: fmt.Errorf("HTTP 429"), after: wait}
-	case resp.StatusCode >= 500:
-		return &retryableError{err: fmt.Errorf("HTTP %d: %s", resp.StatusCode, firstLine(payload))}
-	case resp.StatusCode != http.StatusOK:
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, firstLine(payload))
+	case code >= 500:
+		return &retryableError{err: fmt.Errorf("HTTP %d: %s", code, firstLine(payload))}
+	case code != http.StatusOK:
+		return fmt.Errorf("HTTP %d: %s", code, firstLine(payload))
 	}
+	return nil
+}
 
+// decodeGraphQL unwraps a GraphQL response envelope into out.
+func decodeGraphQL(payload []byte, out any) error {
 	var gr graphQLResponse
 	if err := json.Unmarshal(payload, &gr); err != nil {
 		return &retryableError{err: fmt.Errorf("decode response: %w", err)}
 	}
 	if len(gr.Errors) > 0 {
-		msgs := make([]string, 0, len(gr.Errors))
-		retryable := false
-		for _, e := range gr.Errors {
-			msgs = append(msgs, e.Message)
-			// GitHub returns these transiently under load.
-			if e.Type == "RATE_LIMITED" || strings.Contains(e.Message, "secondary rate limit") {
-				retryable = true
-			}
-		}
-		err := fmt.Errorf("graphql: %s", strings.Join(msgs, "; "))
-		if retryable {
-			return &retryableError{err: err, after: 60 * time.Second}
-		}
-		return err
+		return graphQLErrors(gr.Errors)
 	}
 	if len(gr.Data) == 0 {
 		return &retryableError{err: fmt.Errorf("graphql returned no data")}
@@ -267,45 +300,60 @@ func (c *Client) do(ctx context.Context, body []byte, out any) error {
 	return nil
 }
 
+func graphQLErrors(errs []graphQLError) error {
+	msgs := make([]string, 0, len(errs))
+	retryable := false
+	for _, e := range errs {
+		msgs = append(msgs, e.Message)
+		// GitHub returns these transiently under load.
+		if e.Type == "RATE_LIMITED" || strings.Contains(e.Message, "secondary rate limit") {
+			retryable = true
+		}
+	}
+	err := fmt.Errorf("graphql: %s", strings.Join(msgs, "; "))
+	if retryable {
+		return &retryableError{err: err, after: 60 * time.Second}
+	}
+	return err
+}
+
 func rateLimitWait(resp *http.Response) (time.Duration, bool) {
-	if v := resp.Header.Get("Retry-After"); v != "" {
-		if secs, err := strconv.Atoi(v); err == nil && secs >= 0 {
-			return time.Duration(secs) * time.Second, true
-		}
+	if wait, ok := retryAfter(resp.Header); ok {
+		return wait, true
 	}
-	if resp.Header.Get("X-RateLimit-Remaining") == "0" {
-		if v := resp.Header.Get("X-RateLimit-Reset"); v != "" {
-			if unix, err := strconv.ParseInt(v, 10, 64); err == nil {
-				wait := time.Until(time.Unix(unix, 0))
-				if wait < 0 {
-					wait = 0
-				}
-				// Do not park the refresher for an hour; give up and let the
-				// last good render keep serving.
-				if wait > 5*time.Minute {
-					return 0, false
-				}
-				return wait + time.Second, true
-			}
-		}
+	return resetWait(resp.Header)
+}
+
+func retryAfter(h http.Header) (time.Duration, bool) {
+	secs, err := strconv.Atoi(h.Get("Retry-After"))
+	if err != nil || secs < 0 {
+		return 0, false
 	}
-	return 0, false
+	return time.Duration(secs) * time.Second, true
+}
+
+func resetWait(h http.Header) (time.Duration, bool) {
+	if h.Get("X-RateLimit-Remaining") != "0" {
+		return 0, false
+	}
+	unix, err := strconv.ParseInt(h.Get("X-RateLimit-Reset"), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	wait := max(time.Until(time.Unix(unix, 0)), 0)
+	// Do not park the refresher for an hour; give up and let the last good
+	// render keep serving.
+	if wait > 5*time.Minute {
+		return 0, false
+	}
+	return wait + time.Second, true
 }
 
 func backoff(attempt int) time.Duration {
 	// Bound the shift so the doubling can never overflow; past 5 the cap
 	// below decides anyway.
-	shift := attempt - 1
-	if shift < 0 {
-		shift = 0
-	}
-	if shift > 5 {
-		shift = 5
-	}
-	d := time.Duration(1<<shift) * time.Second
-	if d > 30*time.Second {
-		d = 30 * time.Second
-	}
+	shift := min(max(attempt-1, 0), 5)
+	d := min(time.Duration(1<<shift)*time.Second, 30*time.Second)
 	return d
 }
 
@@ -490,6 +538,26 @@ func (c *Client) Fetch(ctx context.Context, opt Options) (*Data, error) {
 		Timezone:  opt.Location.String(),
 	}
 
+	if err := c.fetchProfile(ctx, opt, data); err != nil {
+		return nil, err
+	}
+	if opt.FetchLanguages {
+		if err := c.fetchLanguageData(ctx, opt, data); err != nil {
+			return nil, err
+		}
+	}
+	if opt.FetchStreak {
+		cals, err := c.fetchCalendars(ctx, opt, data.ContributionYears, now)
+		if err != nil {
+			return nil, fmt.Errorf("calendars: %w", err)
+		}
+		data.Calendars = cals
+	}
+	return data, nil
+}
+
+// fetchProfile fills in the account creation time and contribution years.
+func (c *Client) fetchProfile(ctx context.Context, opt Options, data *Data) error {
 	var profile struct {
 		User struct {
 			CreatedAt               time.Time `json:"createdAt"`
@@ -499,7 +567,7 @@ func (c *Client) Fetch(ctx context.Context, opt Options) (*Data, error) {
 		} `json:"user"`
 	}
 	if err := c.query(ctx, profileQuery, map[string]any{"login": opt.Username}, &profile); err != nil {
-		return nil, fmt.Errorf("profile: %w", err)
+		return fmt.Errorf("profile: %w", err)
 	}
 	data.UserCreatedAt = profile.User.CreatedAt
 
@@ -509,45 +577,46 @@ func (c *Client) Fetch(ctx context.Context, opt Options) (*Data, error) {
 	// it was before 2005, which discards contributions imported from history
 	// that predates the account. GitHub already tells us exactly which years
 	// have contributions; that list is the authority.
-	years := append([]int(nil), profile.User.ContributionsCollection.ContributionYears...)
-	sortInts(years)
-	if opt.StartYear > 0 {
-		kept := years[:0]
-		for _, y := range years {
-			if y >= opt.StartYear {
-				kept = append(kept, y)
-			}
-		}
-		years = kept
+	data.ContributionYears = yearsFrom(profile.User.ContributionsCollection.ContributionYears, opt.StartYear)
+	return nil
+}
+
+// yearsFrom returns a sorted copy of years, without those before start when
+// start is set.
+func yearsFrom(years []int, start int) []int {
+	out := append([]int(nil), years...)
+	sortInts(out)
+	if start <= 0 {
+		return out
 	}
-	data.ContributionYears = years
-
-	if opt.FetchLanguages {
-		repos, err := c.fetchRepos(ctx, opt)
-		if err != nil {
-			return nil, fmt.Errorf("repositories: %w", err)
-		}
-		data.Repositories = repos
-
-		if len(opt.ExcludePaths) > 0 || len(opt.GlobalExcludePaths) > 0 {
-			opt.repos = repos
-			trees, err := c.fetchTrees(ctx, opt)
-			if err != nil {
-				return nil, fmt.Errorf("path exclusions: %w", err)
-			}
-			data.Trees = trees
+	kept := out[:0]
+	for _, y := range out {
+		if y >= start {
+			kept = append(kept, y)
 		}
 	}
+	return kept
+}
 
-	if opt.FetchStreak {
-		cals, err := c.fetchCalendars(ctx, opt, years, now)
-		if err != nil {
-			return nil, fmt.Errorf("calendars: %w", err)
-		}
-		data.Calendars = cals
+// fetchLanguageData fills in the repositories and, when path exclusions are
+// configured, the matching parts of their trees.
+func (c *Client) fetchLanguageData(ctx context.Context, opt Options, data *Data) error {
+	repos, err := c.fetchRepos(ctx, opt)
+	if err != nil {
+		return fmt.Errorf("repositories: %w", err)
 	}
+	data.Repositories = repos
 
-	return data, nil
+	if len(opt.ExcludePaths) == 0 && len(opt.GlobalExcludePaths) == 0 {
+		return nil
+	}
+	opt.repos = repos
+	trees, err := c.fetchTrees(ctx, opt)
+	if err != nil {
+		return fmt.Errorf("path exclusions: %w", err)
+	}
+	data.Trees = trees
+	return nil
 }
 
 // repoNode is the shape both repository queries return.
@@ -604,80 +673,16 @@ func (c *Client) fetchRepos(ctx context.Context, opt Options) ([]Repo, error) {
 	if langs < 1 {
 		langs = 50
 	}
-
-	var privacy any
-	if strings.EqualFold(opt.Visibility, "public") {
-		privacy = "PUBLIC"
-	}
-
 	affiliations := opt.OwnerAffiliations
 	if len(affiliations) == 0 {
 		affiliations = []string{"OWNER"}
 	}
 
-	var out []Repo
-	seen := map[string]bool{}
-
-	add := func(nodes []repoNode) {
-		for _, n := range nodes {
-			key := n.NameWithOwner
-			if key == "" {
-				key = n.Owner.Login + "/" + n.Name
-			}
-			if seen[key] {
-				continue
-			}
-			seen[key] = true
-			out = append(out, toRepo(n))
-		}
-	}
-
-	page := func(query string, vars map[string]any, pick func(json.RawMessage) (repoPage, error)) error {
-		// A hard page ceiling so a pathological response cannot loop forever.
-		const maxPages = 100
-		var cursor *string
-		for i := 0; i < maxPages; i++ {
-			v := make(map[string]any, len(vars)+1)
-			for k, val := range vars {
-				v[k] = val
-			}
-			if cursor != nil {
-				v["cursor"] = *cursor
-			}
-			var raw json.RawMessage
-			if err := c.query(ctx, query, v, &raw); err != nil {
-				return err
-			}
-			p, err := pick(raw)
-			if err != nil {
-				return err
-			}
-			add(p.Nodes)
-			if !p.PageInfo.HasNextPage || p.PageInfo.EndCursor == "" {
-				return nil
-			}
-			end := p.PageInfo.EndCursor
-			cursor = &end
-		}
-		return nil
-	}
-
-	userVars := map[string]any{
+	set := &repoSet{seen: map[string]bool{}}
+	userVars := withPrivacy(map[string]any{
 		"login": opt.Username, "langs": langs, "affiliations": affiliations,
-	}
-	if privacy != nil {
-		userVars["privacy"] = privacy
-	}
-	err := page(repoQuery, userVars, func(raw json.RawMessage) (repoPage, error) {
-		var r struct {
-			User struct {
-				Repositories repoPage `json:"repositories"`
-			} `json:"user"`
-		}
-		err := json.Unmarshal(raw, &r)
-		return r.User.Repositories, err
-	})
-	if err != nil {
+	}, opt.Visibility)
+	if err := c.pageRepos(ctx, repoQuery, userVars, userRepoPage, set); err != nil {
 		return nil, err
 	}
 
@@ -685,25 +690,89 @@ func (c *Client) fetchRepos(ctx context.Context, opt Options) ([]Repo, error) {
 		if strings.TrimSpace(org) == "" {
 			continue
 		}
-		orgVars := map[string]any{"org": org, "langs": langs}
-		if privacy != nil {
-			orgVars["privacy"] = privacy
-		}
-		err := page(orgRepoQuery, orgVars, func(raw json.RawMessage) (repoPage, error) {
-			var r struct {
-				Organization struct {
-					Repositories repoPage `json:"repositories"`
-				} `json:"organization"`
-			}
-			err := json.Unmarshal(raw, &r)
-			return r.Organization.Repositories, err
-		})
-		if err != nil {
+		orgVars := withPrivacy(map[string]any{"org": org, "langs": langs}, opt.Visibility)
+		if err := c.pageRepos(ctx, orgRepoQuery, orgVars, orgRepoPage, set); err != nil {
 			return nil, fmt.Errorf("organization %s: %w", org, err)
 		}
 	}
+	return set.repos, nil
+}
 
-	return out, nil
+// withPrivacy adds the PUBLIC privacy filter when visibility is "public".
+func withPrivacy(vars map[string]any, visibility string) map[string]any {
+	if strings.EqualFold(visibility, "public") {
+		vars["privacy"] = "PUBLIC"
+	}
+	return vars
+}
+
+// repoSet collects repositories in arrival order, deduplicated by owner/name.
+type repoSet struct {
+	seen  map[string]bool
+	repos []Repo
+}
+
+func (s *repoSet) add(nodes []repoNode) {
+	for _, n := range nodes {
+		key := n.NameWithOwner
+		if key == "" {
+			key = n.Owner.Login + "/" + n.Name
+		}
+		if s.seen[key] {
+			continue
+		}
+		s.seen[key] = true
+		s.repos = append(s.repos, toRepo(n))
+	}
+}
+
+// pageRepos follows one repository connection page by page into set.
+func (c *Client) pageRepos(ctx context.Context, query string, vars map[string]any,
+	pick func(json.RawMessage) (repoPage, error), set *repoSet) error {
+	// A hard page ceiling so a pathological response cannot loop forever.
+	const maxPages = 100
+	cursor := ""
+	for range maxPages {
+		v := make(map[string]any, len(vars)+1)
+		maps.Copy(v, vars)
+		if cursor != "" {
+			v["cursor"] = cursor
+		}
+		var raw json.RawMessage
+		if err := c.query(ctx, query, v, &raw); err != nil {
+			return err
+		}
+		p, err := pick(raw)
+		if err != nil {
+			return err
+		}
+		set.add(p.Nodes)
+		if !p.PageInfo.HasNextPage || p.PageInfo.EndCursor == "" {
+			return nil
+		}
+		cursor = p.PageInfo.EndCursor
+	}
+	return nil
+}
+
+func userRepoPage(raw json.RawMessage) (repoPage, error) {
+	var r struct {
+		User struct {
+			Repositories repoPage `json:"repositories"`
+		} `json:"user"`
+	}
+	err := json.Unmarshal(raw, &r)
+	return r.User.Repositories, err
+}
+
+func orgRepoPage(raw json.RawMessage) (repoPage, error) {
+	var r struct {
+		Organization struct {
+			Repositories repoPage `json:"repositories"`
+		} `json:"organization"`
+	}
+	err := json.Unmarshal(raw, &r)
+	return r.Organization.Repositories, err
 }
 
 func (c *Client) fetchCalendars(ctx context.Context, opt Options, years []int, now time.Time) ([]Calendar, error) {
@@ -763,123 +832,174 @@ func (c *Client) fetchCalendars(ctx context.Context, opt Options, years []int, n
 // same host and the same token, so the egress surface is unchanged: still
 // nothing but api.github.com.
 func (c *Client) fetchTrees(ctx context.Context, opt Options) ([]RepoTree, error) {
-	global := normalizePrefixes(opt.GlobalExcludePaths)
-
-	// Work out which repositories to read. Reading a tree costs an API call,
-	// so repositories that never reach the card are skipped.
-	skip := make(map[string]bool, len(opt.ExcludeRepos))
-	for _, n := range opt.ExcludeRepos {
-		skip[n] = true
-	}
-
-	type target struct {
-		repo     Repo
-		prefixes []string
-	}
-	var targets []target
-	seen := map[string]bool{}
-
-	if len(global) > 0 {
-		for _, r := range opt.repos {
-			if skip[r.Name] || skip[r.NameWithOwner] {
-				continue
-			}
-			if opt.ExcludeArchived && r.Archived {
-				continue
-			}
-			targets = append(targets, target{repo: r, prefixes: global})
-			seen[r.Name] = true
+	targets := treeTargets(opt)
+	r := &treeReader{c: c, opt: opt, hackBudget: max(opt.HackFileLimit, 0)}
+	out := make([]RepoTree, 0, len(targets))
+	for _, tgt := range targets {
+		rt, keep, err := r.read(ctx, tgt)
+		if err != nil {
+			return nil, fmt.Errorf("repo %s: %w", tgt.repo.Name, err)
+		}
+		if keep {
+			out = append(out, rt)
 		}
 	}
+	return out, nil
+}
 
+// treeTarget is one repository whose tree is read, and the prefixes to keep.
+type treeTarget struct {
+	repo     Repo
+	prefixes []string
+}
+
+// treeTargets works out which repositories to read: every repository that
+// reaches the card when global prefixes are set, then each repository with
+// its own prefixes. A repository in both is read once with the prefixes
+// merged.
+func treeTargets(opt Options) []treeTarget {
+	targets := globalTargets(opt)
+	global := len(targets)
 	for _, name := range sortedKeysOf(opt.ExcludePaths) {
 		prefixes := normalizePrefixes(opt.ExcludePaths[name])
 		if len(prefixes) == 0 {
 			continue
 		}
-		if seen[name] {
+		if i := indexByName(targets[:global], name); i >= 0 {
 			// Already queued for the global sweep; merge the extra prefixes.
-			for i := range targets {
-				if targets[i].repo.Name == name {
-					targets[i].prefixes = mergePrefixes(targets[i].prefixes, prefixes)
-					break
-				}
-			}
+			targets[i].prefixes = mergePrefixes(targets[i].prefixes, prefixes)
 			continue
 		}
-		repo := Repo{Name: name, Owner: opt.Username}
-		for _, r := range opt.repos {
-			if r.Name == name || r.NameWithOwner == name {
-				repo = r
-				break
-			}
-		}
-		targets = append(targets, target{repo: repo, prefixes: prefixes})
+		targets = append(targets, treeTarget{repo: findRepo(opt, name), prefixes: prefixes})
 	}
+	return targets
+}
 
-	hackBudget := opt.HackFileLimit
-	if hackBudget < 0 {
-		hackBudget = 0
+// globalTargets queues every repository that reaches the card for the global
+// prefixes. Reading a tree costs an API call, so repositories that never
+// reach the card are skipped.
+func globalTargets(opt Options) []treeTarget {
+	global := normalizePrefixes(opt.GlobalExcludePaths)
+	if len(global) == 0 {
+		return nil
 	}
-
-	out := make([]RepoTree, 0, len(targets))
-	for _, tgt := range targets {
-		owner := tgt.repo.Owner
-		if owner == "" {
-			owner = opt.Username
+	skip := make(map[string]bool, len(opt.ExcludeRepos))
+	for _, n := range opt.ExcludeRepos {
+		skip[n] = true
+	}
+	var targets []treeTarget
+	for _, r := range opt.repos {
+		if skip[r.Name] || skip[r.NameWithOwner] || (opt.ExcludeArchived && r.Archived) {
+			continue
 		}
+		targets = append(targets, treeTarget{repo: r, prefixes: global})
+	}
+	return targets
+}
 
-		var resp struct {
-			Tree []struct {
-				Path string `json:"path"`
-				Type string `json:"type"`
-				Size int64  `json:"size"`
-				SHA  string `json:"sha"`
-			} `json:"tree"`
-			Truncated bool `json:"truncated"`
-		}
-		path := fmt.Sprintf("/repos/%s/%s/git/trees/HEAD?recursive=1",
-			url.PathEscape(owner), url.PathEscape(tgt.repo.Name))
-		if err := c.rest(ctx, path, &resp); err != nil {
-			// An empty repository has no HEAD, and a repository named in the
-			// config that cannot be read is a configuration problem rather
-			// than a reason to fail the whole refresh. Record it as empty;
-			// validation reports the mismatch.
-			var nf *notFoundError
-			if errors.As(err, &nf) {
-				out = append(out, RepoTree{Repo: tgt.repo.Name, Prefixes: tgt.prefixes})
-				continue
-			}
-			return nil, fmt.Errorf("repo %s: %w", tgt.repo.Name, err)
-		}
-
-		rt := RepoTree{Repo: tgt.repo.Name, Truncated: resp.Truncated, Prefixes: tgt.prefixes}
-		for _, e := range resp.Tree {
-			if e.Type != "blob" || !matchesPrefix(e.Path, tgt.prefixes) {
-				continue
-			}
-			f := TreeFile{Path: e.Path, Size: e.Size}
-
-			// GitHub labels a .php file with no "<?php" opening tag as Hack.
-			// Read the blob so the right language gets the subtraction.
-			if opt.ResolveHackFiles && strings.EqualFold(pathExt(e.Path), ".php") && hackBudget > 0 {
-				hackBudget--
-				if isPHP, err := c.blobHasPHPTag(ctx, owner, tgt.repo.Name, e.SHA); err == nil {
-					if isPHP {
-						f.Language = "PHP"
-					} else {
-						f.Language = "Hack"
-					}
-				}
-			}
-			rt.Files = append(rt.Files, f)
-		}
-		// Only keep trees that matched something; an empty one is noise.
-		if len(rt.Files) > 0 || len(opt.ExcludePaths[tgt.repo.Name]) > 0 {
-			out = append(out, rt)
+func indexByName(targets []treeTarget, name string) int {
+	for i := range targets {
+		if targets[i].repo.Name == name {
+			return i
 		}
 	}
-	return out, nil
+	return -1
+}
+
+// findRepo resolves a config key, bare or owner/name, to a fetched
+// repository. An unknown key is assumed to be one of the user's own.
+func findRepo(opt Options, name string) Repo {
+	for _, r := range opt.repos {
+		if r.Name == name || r.NameWithOwner == name {
+			return r
+		}
+	}
+	return Repo{Name: name, Owner: opt.Username}
+}
+
+// treeEntry is one entry of a recursive git tree listing.
+type treeEntry struct {
+	Path string `json:"path"`
+	Type string `json:"type"`
+	Size int64  `json:"size"`
+	SHA  string `json:"sha"`
+}
+
+type treeListing struct {
+	Tree      []treeEntry `json:"tree"`
+	Truncated bool        `json:"truncated"`
+}
+
+// treeReader reads trees for one fetch. hackBudget is shared across every
+// repository so HackFileLimit caps the whole run.
+type treeReader struct {
+	c          *Client
+	opt        Options
+	hackBudget int
+}
+
+// read returns the files of one repository under its prefixes, and whether
+// the result is worth keeping.
+func (r *treeReader) read(ctx context.Context, tgt treeTarget) (RepoTree, bool, error) {
+	owner := tgt.repo.Owner
+	if owner == "" {
+		owner = r.opt.Username
+	}
+	listing, err := r.c.treeListing(ctx, owner, tgt.repo.Name)
+	if err != nil {
+		// An empty repository has no HEAD, and a repository named in the
+		// config that cannot be read is a configuration problem rather than
+		// a reason to fail the whole refresh. Record it as empty; validation
+		// reports the mismatch.
+		if _, ok := errors.AsType[*notFoundError](err); ok {
+			return RepoTree{Repo: tgt.repo.Name, Prefixes: tgt.prefixes}, true, nil
+		}
+		return RepoTree{}, false, err
+	}
+
+	rt := RepoTree{Repo: tgt.repo.Name, Truncated: listing.Truncated, Prefixes: tgt.prefixes}
+	for _, e := range listing.Tree {
+		if e.Type != "blob" || !matchesPrefix(e.Path, tgt.prefixes) {
+			continue
+		}
+		rt.Files = append(rt.Files, TreeFile{
+			Path: e.Path, Size: e.Size, Language: r.resolveLanguage(ctx, owner, tgt.repo.Name, e),
+		})
+	}
+	// Only keep trees that matched something; an empty one is noise.
+	keep := len(rt.Files) > 0 || len(r.opt.ExcludePaths[tgt.repo.Name]) > 0
+	return rt, keep, nil
+}
+
+// resolveLanguage settles the .php / Hack question for one file, or returns
+// "" to leave the language to the extension table.
+//
+// GitHub labels a .php file with no "<?php" opening tag as Hack. Read the
+// blob so the right language gets the subtraction. A blob that cannot be read
+// falls back to the extension, which is the same answer as not checking.
+func (r *treeReader) resolveLanguage(ctx context.Context, owner, repo string, e treeEntry) string {
+	if !r.opt.ResolveHackFiles || !strings.EqualFold(pathExt(e.Path), ".php") || r.hackBudget <= 0 {
+		return ""
+	}
+	r.hackBudget--
+	isPHP, err := r.c.blobHasPHPTag(ctx, owner, repo, e.SHA)
+	if err != nil {
+		return ""
+	}
+	if isPHP {
+		return "PHP"
+	}
+	return "Hack"
+}
+
+func (c *Client) treeListing(ctx context.Context, owner, repo string) (treeListing, error) {
+	var listing treeListing
+	path := fmt.Sprintf("/repos/%s/%s/git/trees/HEAD?recursive=1",
+		url.PathEscape(owner), url.PathEscape(repo))
+	if err := c.rest(ctx, path, &listing); err != nil {
+		return treeListing{}, err
+	}
+	return listing, nil
 }
 
 func mergePrefixes(a, b []string) []string {
@@ -938,32 +1058,7 @@ func (c *Client) rest(ctx context.Context, path string, out any) error {
 	}
 	target := (&url.URL{Scheme: base.Scheme, Host: base.Host}).String() + path
 
-	var lastErr error
-	for attempt := 0; attempt <= c.MaxRetries; attempt++ {
-		if attempt > 0 {
-			delay := backoff(attempt)
-			var re *retryableError
-			if errors.As(lastErr, &re) && re.after > 0 {
-				delay = re.after
-			}
-			select {
-			case <-ctx.Done():
-				return ctx.Err()
-			case <-time.After(delay):
-			}
-		}
-
-		err := c.doREST(ctx, target, out)
-		if err == nil {
-			return nil
-		}
-		lastErr = err
-		var re *retryableError
-		if !errors.As(err, &re) {
-			return err
-		}
-	}
-	return fmt.Errorf("after %d attempts: %w", c.MaxRetries+1, lastErr)
+	return c.retry(ctx, func() error { return c.doREST(ctx, target, out) })
 }
 
 func (c *Client) doREST(ctx context.Context, target string, out any) error {
@@ -971,47 +1066,27 @@ func (c *Client) doREST(ctx context.Context, target string, out any) error {
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
-	req.Header.Set("Authorization", "Bearer "+c.Token)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
-	req.Header.Set("User-Agent", c.UserAgent)
 
-	resp, err := c.HTTP.Do(req)
+	resp, payload, err := c.send(req, 16<<20)
 	if err != nil {
-		return &retryableError{err: fmt.Errorf("request: %w", err)}
-	}
-	defer func() {
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-		_ = resp.Body.Close()
-	}()
-
-	payload, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
-	if err != nil {
-		return &retryableError{err: fmt.Errorf("read response: %w", err)}
+		return err
 	}
 
-	switch {
-	case resp.StatusCode == http.StatusNotFound:
+	switch resp.StatusCode {
+	case http.StatusNotFound:
 		return &notFoundError{msg: fmt.Sprintf("not found: %s", firstLine(payload))}
-	case resp.StatusCode == http.StatusConflict:
+	case http.StatusConflict:
 		// A repository with no commits has no tree to walk. That is a normal
 		// state, not a failure worth stopping the refresh over.
 		return &notFoundError{msg: fmt.Sprintf("nothing to read: %s", firstLine(payload))}
-	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
-		if wait, ok := rateLimitWait(resp); ok {
-			return &retryableError{err: fmt.Errorf("rate limited (HTTP %d)", resp.StatusCode), after: wait}
-		}
-		return fmt.Errorf("github rejected the token (HTTP %d): %s", resp.StatusCode, firstLine(payload))
-	case resp.StatusCode == http.StatusTooManyRequests:
-		wait, _ := rateLimitWait(resp)
-		return &retryableError{err: fmt.Errorf("HTTP 429"), after: wait}
-	case resp.StatusCode >= 500:
-		return &retryableError{err: fmt.Errorf("HTTP %d: %s", resp.StatusCode, firstLine(payload))}
-	case resp.StatusCode != http.StatusOK:
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, firstLine(payload))
+	}
+	if err = statusError(resp, payload); err != nil {
+		return err
 	}
 
-	if err := json.Unmarshal(payload, out); err != nil {
+	if err = json.Unmarshal(payload, out); err != nil {
 		return fmt.Errorf("decode response: %w", err)
 	}
 	return nil
